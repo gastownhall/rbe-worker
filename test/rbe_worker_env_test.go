@@ -2,8 +2,6 @@ package scripts_test
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -28,9 +26,9 @@ import (
 //   - every build (CI trusted, rbe-fork and fork-cache runs alike) executes on
 //     //platforms:rbe_worker, whose worker-env is the sha256 of the committed
 //     manifest tools/rbe/worker-env.txt;
-//   - that manifest is what tools/rbe/worker-env prints on the pinned host,
+//   - that manifest is what worker/worker-env prints on the pinned host,
 //     and names the Go and dolt the worker installs;
-//   - blacksmith-worker.sh measures its own host with tools/rbe/worker-env
+//   - blacksmith-worker.sh measures its own host with worker/worker-env
 //     and advertises the sha256 of what it measured, which rbe-west's
 //     schedulers match exactly against the action's.
 //
@@ -46,7 +44,7 @@ const (
 	rbeWorkerPlatformBuild = "platforms/BUILD.bazel"
 	rbeWorkerPlatformLabel = "//platforms:rbe_worker"
 	rbeWorkerEnvManifest   = "tools/rbe/worker-env.txt"
-	rbeWorkerEnvScript     = "tools/rbe/worker-env"
+	rbeWorkerEnvScript     = "worker/worker-env"
 	rbeWorkerEnvProperty   = "worker-env"
 	// What the golden worker.json renderings advertise.
 	rbeWorkerEnvSample = "sha256:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
@@ -78,24 +76,6 @@ func rbeWorkerPlatformExecProperties(t *testing.T, build string) map[string]stri
 	return out
 }
 
-// TestRBEWorkerPlatformPinsWorkerEnv: the platform's worker-env is the
-// sha256 of the committed manifest, and worker-env is all it adds to the
-// key (anything else would be a property no worker advertises).
-func TestRBEWorkerPlatformPinsWorkerEnv(t *testing.T) {
-	root := repoRoot(t)
-	props := rbeWorkerPlatformExecProperties(t, readFile(t, root, rbeWorkerPlatformBuild))
-	pin := props[rbeWorkerEnvProperty]
-	if len(props) != 1 || !workerEnvPinRE.MatchString(pin) {
-		t.Fatalf("rbe_worker exec_properties = %v; want %s=sha256:<hex> alone", props, rbeWorkerEnvProperty)
-	}
-	sum := sha256.Sum256([]byte(readFile(t, root, rbeWorkerEnvManifest)))
-	if want := "sha256:" + hex.EncodeToString(sum[:]); pin != want {
-		t.Errorf("%s pins %s=%s, but %s hashes to %s: commit the manifest and its sha256 together",
-			rbeWorkerPlatformBuild, rbeWorkerEnvProperty, pin, rbeWorkerEnvManifest, want)
-	}
-}
-
-// workerToolset returns blacksmith-worker.sh's WORKER_TOOLSET packages.
 func workerToolset(t *testing.T, script string) []string {
 	t.Helper()
 	m := regexp.MustCompile(`(?s)\nWORKER_TOOLSET=\(([^)]*)\)\n`).FindStringSubmatch(script)
@@ -105,7 +85,7 @@ func workerToolset(t *testing.T, script string) []string {
 	return strings.Fields(m[1])
 }
 
-// workerEnvList returns the words of tools/rbe/worker-env's NAME=( ... )
+// workerEnvList returns the words of worker/worker-env's NAME=( ... )
 // array, comments dropped.
 func workerEnvList(t *testing.T, envScript, name string) []string {
 	t.Helper()
@@ -121,7 +101,7 @@ func workerEnvList(t *testing.T, envScript, name string) []string {
 	return words
 }
 
-// workerEnvMeasured returns tools/rbe/worker-env's measured packages and the
+// workerEnvMeasured returns worker/worker-env's measured packages and the
 // upstream version components each keeps.
 func workerEnvMeasured(t *testing.T, envScript string) map[string]int {
 	t.Helper()
@@ -140,7 +120,7 @@ func workerEnvMeasured(t *testing.T, envScript string) map[string]int {
 }
 
 // TestRBEWorkerEnvManifestNamesTheWorkerHost: the committed manifest is a
-// tools/rbe/worker-env rendering (sorted; one arch, dolt, go, os and yq
+// worker/worker-env rendering (sorted; one arch, dolt, go, os and yq
 // line; every measured package installed, at its upstream release cut to the
 // script's components and nothing finer) of a host with the Go of go.mod and
 // the dolt blacksmith-worker.sh installs, so bumping either without a new
@@ -151,11 +131,11 @@ func TestRBEWorkerEnvManifestNamesTheWorkerHost(t *testing.T) {
 	script := readFile(t, root, rbeWorkerScript)
 	envScript := readFile(t, root, rbeWorkerEnvScript)
 	if !strings.HasSuffix(manifest, "\n") {
-		t.Fatalf("%s must end with a newline, as tools/rbe/worker-env prints it", rbeWorkerEnvManifest)
+		t.Fatalf("%s must end with a newline, as worker/worker-env prints it", rbeWorkerEnvManifest)
 	}
 	lines := strings.Split(strings.TrimSuffix(manifest, "\n"), "\n")
 	if !slices.IsSorted(lines) {
-		t.Errorf("%s is not sorted (LC_ALL=C), as tools/rbe/worker-env prints it", rbeWorkerEnvManifest)
+		t.Errorf("%s is not sorted (LC_ALL=C), as worker/worker-env prints it", rbeWorkerEnvManifest)
 	}
 	goVersion := regexp.MustCompile(`(?m)^go (\S+)$`).FindStringSubmatch(readFile(t, root, "go.mod"))
 	dolt := regexp.MustCompile(`(?m)^DOLT_VERSION=(\S+)$`).FindStringSubmatch(script)
@@ -213,13 +193,13 @@ func TestRBEWorkerEnvManifestNamesTheWorkerHost(t *testing.T) {
 		}
 	}
 	if !slices.Equal(pkgs, wantPkgs) {
-		t.Errorf("%s packages:\n%v\nwant tools/rbe/worker-env's measured packages:\n%v", rbeWorkerEnvManifest, pkgs, wantPkgs)
+		t.Errorf("%s packages:\n%v\nwant worker/worker-env's measured packages:\n%v", rbeWorkerEnvManifest, pkgs, wantPkgs)
 	}
 }
 
 // TestRBEWorkerEnvAccountsForTheToolset: every WORKER_TOOLSET package is
 // either measured or named unmeasured (with its reason, in
-// tools/rbe/worker-env), never both, and unmeasured names nothing the
+// worker/worker-env), never both, and unmeasured names nothing the
 // worker no longer installs. A package added to the toolset is a decision
 // about the key, not an accident of it.
 func TestRBEWorkerEnvAccountsForTheToolset(t *testing.T) {
@@ -327,7 +307,7 @@ func TestRBEWorkerEnvUpstream(t *testing.T) {
 	}
 }
 
-// workerEnvHost describes a stub host for tools/rbe/worker-env: what uname,
+// workerEnvHost describes a stub host for worker/worker-env: what uname,
 // os-release, go, dolt and yq say, and dpkg's installed versions by package
 // (one per architecture, space-separated; a package not listed is not
 // installed; "!V" is deinstalled at V). An empty dolt, go or yq is not on
@@ -344,7 +324,7 @@ func (h workerEnvHost) with(f func(*workerEnvHost)) workerEnvHost {
 	return c
 }
 
-// measureWorkerEnv runs tools/rbe/worker-env (args) on a stub host and
+// measureWorkerEnv runs worker/worker-env (args) on a stub host and
 // returns what it prints, or its error and output.
 func measureWorkerEnv(t *testing.T, h workerEnvHost, args ...string) (string, error) {
 	t.Helper()
@@ -436,7 +416,7 @@ var blacksmithImage20261006 = workerEnvHost{
 	},
 }
 
-// TestRBEWorkerEnvScript runs tools/rbe/worker-env on a stub host: one
+// TestRBEWorkerEnvScript runs worker/worker-env on a stub host: one
 // sorted line per fact, each measured package at its upstream release cut to
 // its components and reported per installed architecture once, a removed or
 // unknown package "missing", go asked with GOTOOLCHAIN=local away from any
@@ -596,7 +576,7 @@ func TestRBEWorkerEnvKeysToolchainNotPatches(t *testing.T) {
 	}
 }
 
-// runRBEScript runs a tools/rbe script with bash in dir (the test's cwd if
+// runRBEScript runs a worker script with bash in dir (the test's cwd if
 // empty) and exactly env, and returns its stdout and stderr.
 func runRBEScript(dir string, env []string, script string, args ...string) (stdout, stderr string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -611,7 +591,7 @@ func runRBEScript(dir string, env []string, script string, args ...string) (stdo
 }
 
 // TestRBEWorkerScriptAdvertisesWorkerEnv: blacksmith-worker.sh installs its
-// toolset, measures the host with tools/rbe/worker-env, and advertises the
+// toolset, measures the host with worker/worker-env, and advertises the
 // sha256 of the measurement (never the pin, never the raw listing) before
 // any worker.json is rendered.
 func TestRBEWorkerScriptAdvertisesWorkerEnv(t *testing.T) {
@@ -683,47 +663,4 @@ func checkWorkerJSONAdvertises(out []byte, want string) error {
 func platformFlag(flag string) bool {
 	name, _, _ := strings.Cut(flag, "=")
 	return strings.Contains(name, "platforms") || strings.Contains(name, "host_platform") || strings.Contains(name, "exec_properties")
-}
-
-// TestBazelExecutesOnWorkerPlatform: .bazelrc selects //platforms:rbe_worker
-// unconditionally (a key-affecting flag under remote-exec or fork-cache, or
-// in a CI-written rc, would key those runs apart) and nothing
-// else touches platforms or exec properties, and the PATH CI's tests run
-// with is the one worker-env measures.
-func TestBazelExecutesOnWorkerPlatform(t *testing.T) {
-	root := repoRoot(t)
-	want := "build --extra_execution_platforms=" + rbeWorkerPlatformLabel
-	var platforms []string
-	testPath := ""
-	for _, line := range strings.Split(readFile(t, root, ".bazelrc"), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
-			continue
-		}
-		for _, flag := range fields[1:] {
-			if platformFlag(flag) {
-				platforms = append(platforms, fields[0]+" "+flag)
-			}
-			if v, ok := strings.CutPrefix(flag, "--test_env=PATH="); ok && fields[0] == "test" {
-				testPath = v
-			}
-		}
-	}
-	if !slices.Equal(platforms, []string{want}) {
-		t.Errorf(".bazelrc platform flags %q, want %q alone", platforms, want)
-	}
-
-	// bazel.yml's lanes: setup-bazel's generated rc stays off platforms too
-	// (.bazelrc's build:ci lines are checked above with every other config).
-	for _, line := range strings.Split(readFile(t, root, ".github/actions/setup-bazel/write-bazelrc.sh"), "\n") {
-		for _, flag := range strings.Fields(line) {
-			if strings.HasPrefix(flag, "--") && platformFlag(flag) {
-				t.Errorf("setup-bazel's write-bazelrc.sh writes %q; platform flags are key-affecting and belong in .bazelrc", line)
-			}
-		}
-	}
-	m := regexp.MustCompile(`(?m)^PATH=\$\{WORKER_ENV_PATH:-([^}]*)\}$`).FindStringSubmatch(readFile(t, root, rbeWorkerEnvScript))
-	if m == nil || testPath == "" || m[1] != testPath {
-		t.Errorf("CI tests' PATH %q, worker-env measures %v: they must be the same", testPath, m)
-	}
 }

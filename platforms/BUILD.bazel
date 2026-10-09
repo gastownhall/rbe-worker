@@ -1,0 +1,13 @@
+# Self-test fixture (rbe-worker S2 scaffolding): a synthetic "product"
+# platforms/BUILD.bazel, paired with tools/rbe/worker-env.txt below, so that
+# the moved farm tests (test/rbe_worker_env_test.go,
+# test/rbe_worker_env_drift_test.go) can exercise worker/worker-env and
+# worker/blacksmith-worker.sh's measurement and drift logic without a real
+# product checkout. See docs/provenance/ for how this differs from the
+# files gascity and beads actually commit at these same paths.
+platform(
+    name = "rbe_worker",
+    exec_properties = {
+        "worker-env": "sha256:46fb1bc45f1f64c96fd15b3d595d954dc496f22ed5ea1a34de8ccc90b35fa1c9",
+    },
+)

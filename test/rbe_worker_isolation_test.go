@@ -17,97 +17,22 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
-// The OSS remote-execution workers (tools/rbe/blacksmith-worker.sh, run by
+// The OSS remote-execution workers (worker/blacksmith-worker.sh, run by
 // .github/workflows/rbe-worker-pool.yml on Blacksmith) execute actions from OSS
 // CI and cherry agents' oss builds. Before S11.3 every action ran as the runner
 // user: it could read pki/worker.key (the rbe-oss-worker cert, which writes the
 // oss action cache and registers workers) and the step's environment, and sudo.
 // These tests pin the action isolation that closes that (infra
-// nativelink-cas/west README "Action isolation"; tools/rbe/rbe-action-* are
+// nativelink-cas/west README "Action isolation"; worker/rbe-action-* are
 // copies of infra's) and the switch that rolls it back.
 
 const (
-	rbeWorkerScript   = "tools/rbe/blacksmith-worker.sh"
+	rbeWorkerScript   = "worker/blacksmith-worker.sh"
 	rbeWorkerWorkflow = ".github/workflows/rbe-worker-pool.yml"
 )
 
-func TestRBEWorkerPoolWorkflowIsolatesActions(t *testing.T) {
-	root := repoRoot(t)
-	var wf struct {
-		Jobs map[string]struct {
-			Steps []struct {
-				Uses string            `yaml:"uses"`
-				With map[string]any    `yaml:"with"`
-				Env  map[string]string `yaml:"env"`
-				Run  string            `yaml:"run"`
-			} `yaml:"steps"`
-		} `yaml:"jobs"`
-	}
-	if err := yaml.Unmarshal([]byte(readFile(t, root, rbeWorkerWorkflow)), &wf); err != nil {
-		t.Fatalf("parse %s: %v", rbeWorkerWorkflow, err)
-	}
-	job, ok := wf.Jobs["worker"]
-	if !ok {
-		t.Fatalf("%s: no worker job", rbeWorkerWorkflow)
-	}
-	var checkout, worker bool
-	for _, step := range job.Steps {
-		if strings.HasPrefix(step.Uses, "actions/checkout@") {
-			checkout = true
-			// Remote actions run on this runner: no GITHUB_TOKEN in .git/config.
-			if v, _ := step.With["persist-credentials"].(bool); v || step.With["persist-credentials"] == nil {
-				t.Errorf("checkout must set persist-credentials: false, got %v", step.With["persist-credentials"])
-			}
-		}
-		// The worker-env measure step runs the script too, without a worker.
-		if strings.Contains(step.Run, rbeWorkerScript) && step.Env["WORKER_MODE"] != "measure" {
-			worker = true
-			// Default on; the repository variable RBE_ACTION_ISOLATION=0 is the
-			// rollback without a code change.
-			if got, want := step.Env["RBE_ACTION_ISOLATION"], "${{ vars.RBE_ACTION_ISOLATION || '1' }}"; got != want {
-				t.Errorf("worker step RBE_ACTION_ISOLATION = %q, want %q", got, want)
-			}
-			// canary: one run in RBE_ACTION_CANARY_EVERY tries isolation.
-			if got, want := step.Env["RBE_ACTION_CANARY_EVERY"], "${{ vars.RBE_ACTION_CANARY_EVERY || '4' }}"; got != want {
-				t.Errorf("worker step RBE_ACTION_CANARY_EVERY = %q, want %q", got, want)
-			}
-			// zstd fetches, off unless the repository variable says 1: merging
-			// changes nothing, and rollback is the variable.
-			if got, want := step.Env["RBE_WIRE_ZSTD"], "${{ vars.RBE_WIRE_ZSTD || '0' }}"; got != want {
-				t.Errorf("worker step RBE_WIRE_ZSTD = %q, want %q", got, want)
-			}
-			// The dedicated zread host; the worker refuses zstd without it.
-			if got, want := step.Env["RBE_WIRE_ZSTD_READ_URL"], "${{ vars.RBE_WIRE_ZSTD_READ_URL || '' }}"; got != want {
-				t.Errorf("worker step RBE_WIRE_ZSTD_READ_URL = %q, want %q", got, want)
-			}
-			// The OSS pool keeps the script's defaults (tier oss, :443) and its
-			// own certificate; the fork tier is rbe-fork-pool.yml's alone.
-			for _, k := range []string{"WORKER_TIER", "RBE_WEST_PORT"} {
-				if v, ok := step.Env[k]; ok {
-					t.Errorf("worker step sets %s=%q; the OSS pool runs the defaults", k, v)
-				}
-			}
-			if got, want := step.Env["RBE_WORKER_TLS_KEY"], "${{ secrets.RBE_WORKER_TLS_KEY }}"; got != want {
-				t.Errorf("worker step RBE_WORKER_TLS_KEY = %q, want %q", got, want)
-			}
-		}
-	}
-	if !checkout || !worker {
-		t.Fatalf("%s: checkout step found %v, worker step found %v", rbeWorkerWorkflow, checkout, worker)
-	}
-}
-
-// TestRBEWorkerScriptPathsResolveInTree proves the S1 refactor is a no-op
-// for today's callers: with RBE_PRODUCT_ROOT unset and the cwd at the repo
-// root (how the pool workflows run the script), HERE and RBE_PRODUCT_ROOT
-// must resolve to exactly the paths the old cwd-relative tools/rbe/... and
-// go.mod reads did. It runs only the script's path-resolution prelude
-// (everything up to and including the "rbe-worker: ..." log line), not the
-// whole script.
 func TestRBEWorkerScriptPathsResolveInTree(t *testing.T) {
 	root := repoRoot(t)
 	script := readFile(t, root, rbeWorkerScript)
@@ -130,9 +55,9 @@ func TestRBEWorkerScriptPathsResolveInTree(t *testing.T) {
 		script2 += fmt.Sprintf(`echo "HERE/%s=$HERE/%s"`+"\n", s, s)
 	}
 	// BASH_SOURCE[0]'s dirname is how HERE is computed, so the probe script
-	// must live beside the real siblings in tools/rbe, exactly like
+	// must live beside the real siblings in worker, exactly like
 	// blacksmith-worker.sh does today.
-	rbeDir := filepath.Join(root, "tools", "rbe")
+	rbeDir := filepath.Join(root, "worker")
 	probe := filepath.Join(rbeDir, ".paths-resolve-probe.sh")
 	if err := os.WriteFile(probe, []byte(script2), 0o755); err != nil {
 		t.Fatalf("write probe script: %v", err)
@@ -411,7 +336,7 @@ func TestRBEWorkerJSONIsolationOffMatchesPreO1(t *testing.T) {
 		{"fork", "grpcs://rbe-fork.example.invalid:8444", iso, "worker-fork.golden.json"},
 	} {
 		out := render(t, c.tier, c.host, c.isolation)
-		golden, err := os.ReadFile(filepath.Join(root, "scripts", "testdata", "rbe-worker", c.golden))
+		golden, err := os.ReadFile(filepath.Join(root, "test", "testdata", "golden", c.golden))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -686,9 +611,9 @@ func TestRBEWorkerScriptGatesNativeLinkOnIsolation(t *testing.T) {
 		t.Errorf("both poll loops must run the sweep first, found %d", n)
 	}
 	for _, f := range []string{"rbe-action-entry.c", "rbe-action-launch", "rbe-action-sweep", "rbe-action-selftest"} {
-		body := readFile(t, root, "tools/rbe/"+f)
+		body := readFile(t, root, "worker/"+f)
 		if !strings.Contains(body, f+": ") || !strings.Contains(body, "/usr/local/libexec/rbe-action/") {
-			t.Errorf("tools/rbe/%s is not infra's rbe-action file", f)
+			t.Errorf("worker/%s is not infra's rbe-action file", f)
 		}
 	}
 }
@@ -704,8 +629,8 @@ func TestRBEWorkerScriptGatesNativeLinkOnIsolation(t *testing.T) {
 // loopback-only actions. The selftest proves no action reaches a resolver.
 func TestRBEActionMaskSockets(t *testing.T) {
 	root := repoRoot(t)
-	launch := readFile(t, root, "tools/rbe/rbe-action-launch")
-	selftest := readFile(t, root, "tools/rbe/rbe-action-selftest")
+	launch := readFile(t, root, "worker/rbe-action-launch")
+	selftest := readFile(t, root, "worker/rbe-action-selftest")
 	for _, want := range []string{
 		"MASK_SOCKETS=${MASK_SOCKETS:-0}\n",
 		`[[ $MASK_SOCKETS == [01] ]] || die "MASK_SOCKETS must be 0 or 1"`,
@@ -762,7 +687,7 @@ func TestRBEActionMaskSockets(t *testing.T) {
 // starts.
 func TestRBEActionPerActionNetwork(t *testing.T) {
 	root := repoRoot(t)
-	launch := readFile(t, root, "tools/rbe/rbe-action-launch")
+	launch := readFile(t, root, "worker/rbe-action-launch")
 	fn := regexp.MustCompile(`(?s)\naction_netns\(\) \{\n.*?\n\}\n`).FindString(launch)
 	if fn == "" {
 		t.Fatal("rbe-action-launch: no action_netns() function")
@@ -840,7 +765,7 @@ func TestRBEActionPerActionNetwork(t *testing.T) {
 		t.Errorf("rbe-action-launch: %d [[ $NETNS == 1 ]], want 1 (action_netns)", n)
 	}
 
-	selftest := readFile(t, root, "tools/rbe/rbe-action-selftest")
+	selftest := readFile(t, root, "worker/rbe-action-selftest")
 	for _, want := range []string{
 		// The main probe runs as an action without the property does.
 		`RBE_X_TIMEOUT_MS=300000 RBE_X_NETWORK= "$LIB/entry" /bin/bash -c "$probe"`,
@@ -961,7 +886,7 @@ func TestRBEWorkerIsolationCanary(t *testing.T) {
 		}
 		return r
 	}
-	golden, err := os.ReadFile(filepath.Join(root, "scripts", "testdata", "rbe-worker", "worker-isolation-off.golden.json"))
+	golden, err := os.ReadFile(filepath.Join(root, "test", "testdata", "golden", "worker-isolation-off.golden.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1146,7 +1071,7 @@ func TestRBEWorkerScrubCAS(t *testing.T) {
 	}
 }
 
-// Max review, 2026-10-07: the full selftest's mount walk (tools/rbe/rbe-
+// Max review, 2026-10-07: the full selftest's mount walk (worker/rbe-
 // action-selftest's full_probe) found no-shared-writable-dir by `find`ing
 // every reachable mount, including Blacksmith's large, mostly-read-only tool
 // caches (~49 s of the walk). A mount whose own options already say ro (a
@@ -1156,13 +1081,13 @@ func TestRBEWorkerScrubCAS(t *testing.T) {
 // remounted ro) and a world-writable directory an image adds under /dev
 // (ROOT_RO's own remount loop skips /dev/* by path, rbe-action-launch) must
 // still fail it. Container regression cases (privileged ubuntu:24.04,
-// tools/rbe/blacksmith-worker.sh's isolate()-to-selftest section, the
+// worker/blacksmith-worker.sh's isolate()-to-selftest section, the
 // /data/tmp/r3-e2e/inside.sh pattern): V1 ROOT_RO=1 fork with a large
 // read-only tool cache passes; V2 ROOT_RO=0 plus a world-writable tool cache
 // fails; V3 a 1777 directory under /dev fails; R4 the entrypoint dropped
 // from worker.json (unrelated to the mount walk) still fails.
 func TestRBEActionSelftestMountWalkSkipsReadOnly(t *testing.T) {
-	selftest := readFile(t, repoRoot(t), "tools/rbe/rbe-action-selftest")
+	selftest := readFile(t, repoRoot(t), "worker/rbe-action-selftest")
 	for _, want := range []string{
 		// The options column (mountinfo field 6) is read, not discarded.
 		"while read -r _ _ _ _ m o _; do",
