@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# bump-summary OLD NEW   print a step-summary body for a worker-pin bump
+#
+# Run from inside an rbe-worker checkout (any worktree that has both OLD and
+# NEW, e.g. the tree fetch.sh leaves at $RBE_WORKER_DIR/..): the compare URL,
+# the commit list OLD..NEW, and whether the bump touches the measurement
+# (worker/worker-env, worker/worker-env-drift), isolation (worker/rbe-action-*)
+# or microVM (worker/microvm/) files, which call for extra care before
+# merging (§5.5). OLD and NEW must each be a 40-hex commit already in this
+# checkout's history; it never fetches.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+root=$(cd "$here/.." && pwd -P)
+
+usage() { echo "usage: bump-summary OLD NEW" >&2; exit 2; }
+[ $# -eq 2 ] || usage
+old=$1 new=$2
+for sha in "$old" "$new"; do
+	[[ $sha =~ ^[0-9a-f]{40}$ ]] || usage
+	git -C "$root" cat-file -e "$sha^{commit}" 2>/dev/null || { echo "bump-summary: $sha is not a commit in $root" >&2; exit 1; }
+done
+
+echo "### rbe-worker bump"
+echo
+echo "Compare: https://github.com/gastownhall/rbe-worker/compare/${old}...${new}"
+echo
+echo "Commits:"
+echo '```'
+git -C "$root" log --format='%h %s' "$old..$new"
+echo '```'
+echo
+
+changed=$(git -C "$root" diff --name-only "$old" "$new" --)
+flag() {
+	local label=$1 pattern=$2
+	if grep -qE "$pattern" <<<"$changed"; then
+		echo "- **$label**: changed, review closely"
+	else
+		echo "- $label: unchanged"
+	fi
+}
+echo "Files that call for extra care:"
+flag "measurement (worker/worker-env, worker/worker-env-drift)" '^worker/worker-env(-drift)?$'
+flag "isolation (worker/rbe-action-*)" '^worker/rbe-action-'
+flag "microVM (worker/microvm/)" '^worker/microvm/'

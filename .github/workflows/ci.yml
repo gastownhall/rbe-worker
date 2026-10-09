@@ -1,0 +1,114 @@
+name: ci
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * *"
+permissions:
+  contents: read
+jobs:
+  # shellcheck, the two entry builds, actionlint and the client composite-only
+  # check. No product fetch here: only this repo's own tree.
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: shellcheck (worker/*, client/*/*.sh, bin/bump-summary)
+        run: |
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck --version
+          shellcheck -S warning \
+            worker/blacksmith-worker.sh worker/rbe-action-launch \
+            worker/rbe-action-selftest worker/rbe-action-sweep \
+            worker/worker-env worker/worker-env-drift \
+            client/setup-bazel/*.sh bin/bump-summary
+      - name: gcc -Werror (both rbe-action-entry.c builds)
+        run: |
+          gcc -static -O2 -Wall -Wextra -Werror -o /tmp/rbe-entry worker/rbe-action-entry.c
+          gcc -static -O2 -Wall -Wextra -Werror -DRBE_ACTION_EXEC -o /tmp/rbe-exec worker/rbe-action-entry.c
+      - name: actionlint (pinned binary + sha256)
+        run: |
+          set -euo pipefail
+          version=1.7.8
+          sha256=be92c2652ab7b6d08425428797ceabeb16e31a781c07bc388456b4e592f3e36a
+          curl -sSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color
+      - name: client actions composite-only (cmd/product-check)
+        run: go run ./cmd/product-check
+
+  # go test ./... (worker, client and product-fixture tests), plus the Python
+  # ci-analytics extractor's own suite. client/setup-bazel behaviour tests
+  # (fork-credential pins/retries, rc transport-only per mode) are added in
+  # S10c, once client/setup-bazel is the reconciled core rather than beads'
+  # unreconciled copy.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: go test ./...
+        run: go test ./...
+      - name: python3 -m unittest (client/ci-analytics)
+        run: python3 -m unittest discover -s client/ci-analytics -p "*_test.py" -v
+
+  # go test -tags integration ./...; WORKER_MODE=selftest for WORKER_TIER=oss
+  # and =fork (matrix, fresh VM each). H1 wiring: the selftest mode itself
+  # does not land until the H1 slice (after S2), so this job is a placeholder
+  # until then (no integration-tagged tests exist yet, so it passes trivially).
+  privileged:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: go test -tags integration ./...
+        run: go test -tags integration ./...
+      # TODO(H1): a worker_tier: [oss, fork] matrix running
+      # WORKER_MODE=selftest WORKER_TIER=<tier> worker/blacksmith-worker.sh,
+      # once H1 lands (§9 "H1. WORKER_MODE=selftest"). Left as a single job
+      # (not a matrix) until then, so the "privileged" required status check
+      # name (§6.2) stays stable.
+
+  # /dev/kvm udev rule; RBE_SANDBOX=microvm selftest. continue-on-error until
+  # proven (S6): the microVM launcher has not landed in rbe-worker yet.
+  kvm:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: /dev/kvm present
+        run: test -e /dev/kvm && ls -l /dev/kvm
+      # TODO(S6): RBE_SANDBOX=microvm selftest, once the microVM launcher
+      # (§9 "S6. microVM launcher into rbe-worker") lands.
+
+  # Anonymous fetch of gascity and beads main; go run ./cmd/product-check
+  # (worker + client items) against each. Informational: a drift between this
+  # repo's contract and either product shows up here first.
+  product-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: fetch gascity and beads main (anonymous, read-only)
+        run: |
+          git clone --depth 1 https://github.com/gastownhall/gascity.git /tmp/gascity
+          git clone --depth 1 https://github.com/gastownhall/beads.git /tmp/beads
+      - name: product-check against gascity main (worker + client items)
+        run: go run ./cmd/product-check --product-root /tmp/gascity
+        continue-on-error: true
+      - name: product-check against beads main (client items only; beads does not run the farm)
+        run: go run ./cmd/product-check --product-root /tmp/beads --skip-worker
+        continue-on-error: true

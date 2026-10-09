@@ -2,8 +2,8 @@
 
 Three fixture kinds, per the design doc (section 3.5):
 
-  - testdata/ci_analytics/real/*: genuine Bazel 9.2.0 output from an
-    isolated scratch workspace (tools/bazel/testdata/ci_analytics/regen.sh),
+  - testdata/real/*: genuine Bazel 9.2.0 output from an
+    isolated scratch workspace (testdata/regen.sh),
     with no remote flags and no ambient environment (env -i). The BEP is
     filtered down to only the fields the extractor reads before being
     committed; the exec log is committed decompressed (*.binpb) so these
@@ -13,7 +13,7 @@ Three fixture kinds, per the design doc (section 3.5):
   - a synthetic remote fixture, built here with a small protobuf encoder,
     for the `remote` and `remote cache hit` runner classes this sandbox has
     no RBE endpoint to produce for real.
-  - testdata/ci_analytics/poisoned-bep.json: a BEP file whose every
+  - testdata/poisoned-bep.json: a BEP file whose every
     extractor-visible field (including a couple of hostile labels) carries
     an embedded secret or leaky value. The summary built from it must
     contain none of them.
@@ -34,7 +34,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 import ci_analytics_extract as extract  # noqa: E402
 
-TESTDATA = os.path.join(os.path.dirname(__file__), "testdata", "ci_analytics")
+TESTDATA = os.path.join(os.path.dirname(__file__), "testdata")
 REAL = os.path.join(TESTDATA, "real")
 
 
@@ -341,7 +341,7 @@ class ExtractorHelperTests(unittest.TestCase):
 
 
 class RealFixtureTests(unittest.TestCase):
-    """testdata/ci_analytics/real/*: genuine Bazel 9.2.0 output."""
+    """testdata/real/*: genuine Bazel 9.2.0 output."""
 
     @staticmethod
     def _fixture_critical_path_time():
@@ -631,7 +631,7 @@ SECRET_MARKERS = (
 
 
 class PoisonedBEPTests(unittest.TestCase):
-    """testdata/ci_analytics/poisoned-bep.json: every field the extractor
+    """testdata/poisoned-bep.json: every field the extractor
     reads carries a secret or a leaky value, including two hostile labels
     (one tripwire-triggering, one with injected text in its status/
     runnerCount fields). The summary must contain none of them, whether

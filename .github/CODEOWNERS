@@ -1,0 +1,4 @@
+# Advisory only: the rbe-worker ruleset requires 0 approvals and no
+# code-owner review (D4). This file exists for visibility (auto-requested
+# review, and the GitHub UI's ownership view), not as an enforced gate.
+* @gastownhall/rbe-worker-maintainers

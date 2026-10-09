@@ -1,0 +1,6 @@
+# Self-test fixture (rbe-worker S2 scaffolding), paired with
+# platforms/BUILD.bazel and tools/rbe/worker-env.txt: the one line
+# cmd/product-check's worker items check against worker/worker-env's own
+# default (WORKER_ENV_PATH). gascity and beads commit the real file at this
+# same path (docs/provenance/); this is not it.
+test --test_env=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
