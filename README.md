@@ -7,9 +7,8 @@ consume this repo by commit SHA, never by `main` at run time: see
 [`.github/actions/rbe-worker/`](.github/actions/rbe-worker) (worker code) and
 `client/*/action.yml` (shared client actions).
 
-See `/data/projects/rbe-worker-repo-design.md` (the design this repo
-implements) for the full rationale, disposition tables and slice plan. This
-README covers only the contract a caller needs.
+This README covers only the contract a caller needs. Provenance of the
+imported history (gascity and beads commit maps) is in `docs/provenance/`.
 
 ## Layout
 
