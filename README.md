@@ -80,3 +80,7 @@ Changes here merge with **0 required approvals** (`rbe-worker-maintainers` =
 the compensating controls (visibility, signed and verified commits, the
 `worker-host`/`worker-isolation` gates, the independent isolation probe) and
 the accepted residual (§6.5, D4, R26).
+
+## Merging
+
+Changes land by squash-merged pull request only; `main` requires signed commits and green CI (see the repository ruleset).
