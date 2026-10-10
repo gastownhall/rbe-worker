@@ -94,8 +94,9 @@ func TestRBEWorkerScriptIsolationSwitch(t *testing.T) {
 		// the rollback renders today's worker.json.
 		`} } + $isolation) } ],`,
 		`--argjson isolation "$isolation"`,
-		// Rollback starts NativeLink exactly as before.
-		"else\n\t\"$NL_BIN_DIR/nativelink\" \"$ROOT/worker.json\" >\"$ROOT/worker.log\" 2>&1 &\nfi\n",
+		// Rollback starts NativeLink as before (only its log filter is set:
+		// the boot-to-first-action line reads local_worker's receipt lines).
+		"else\n\tRUST_LOG=\"$NL_RUST_LOG\" \"$NL_BIN_DIR/nativelink\" \"$ROOT/worker.json\" >\"$ROOT/worker.log\" 2>&1 &\nfi\n",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("%s missing %q", rbeWorkerScript, want)
@@ -594,7 +595,7 @@ func TestRBEWorkerScriptGatesNativeLinkOnIsolation(t *testing.T) {
 		// Mode 1 runs the checks in this shell: any failure ends the worker.
 		"\telse\n\t\tisolate\n\tfi\n",
 		// NativeLink gets none of the step's environment (secrets included).
-		`env -i PATH="$PATH" HOME="$HOME" "$NL_BIN_DIR/nativelink" "$ROOT/worker.json"`,
+		`env -i PATH="$PATH" HOME="$HOME" RUST_LOG="$NL_RUST_LOG" "$NL_BIN_DIR/nativelink" "$ROOT/worker.json"`,
 		"nl=$!",
 	}
 	at := 0

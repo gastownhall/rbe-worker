@@ -68,6 +68,21 @@
 #                       the fork pool) to 0; for an emergency rollback cancel
 #                       the pool runs, since an in-flight worker keeps its
 #                       store (and this switch) until it retires.
+#   RBE_WARM_URL        optional https://HOST[/PREFIX] of rbe-west's warm set
+#                       (infra README "Warm worker caches"): a read-only bundle
+#                       of hot CAS blobs (toolchains, the Go SDK, dependency
+#                       archives) that the core selects from trusted results
+#                       and publishes on R2; no pool VM can write it. Fetched in
+#                       the background while isolation sets up, every blob
+#                       re-hashed against its name (warm-cas) before NativeLink
+#                       starts and loads it: a failure costs the warm start,
+#                       never the worker. Empty (default): a cold CAS, as before.
+#   RBE_WARM_EVERY      1 (default): every worker warms. N: only runs whose
+#                       GITHUB_RUN_ID is a multiple of N (the A/B canary).
+#   RBE_WARM_SECONDS    how long the warm fetch may run, from its start (default
+#                       75; isolation and its selftest take about 65 s)
+#   RBE_WARM_GRACE      seconds it may run on once isolation is ready (default 5):
+#                       registration waits for the warm fetch at most this long
 #   RBE_ACTION_ISOLATION  1 (default): every action runs as a per-action slot
 #                       user in private namespaces (below). 0: the rollback
 #                       switch, actions run as this runner user as before.
@@ -100,6 +115,15 @@ case "${RBE_WIRE_ZSTD:-0}" in
 0) wire_zstd=false ;;
 *) echo "RBE_WIRE_ZSTD must be 0 or 1" >&2; exit 2 ;;
 esac
+warm=0
+if [ -n "${RBE_WARM_URL:-}" ] && [ "$WORKER_MODE" = pool ]; then
+	if [[ $RBE_WARM_URL =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ && ${RBE_WARM_EVERY:-1} =~ ^[1-9][0-9]{0,5}$ &&
+		${RBE_WARM_SECONDS:-75} =~ ^[1-9][0-9]{0,3}$ && ${RBE_WARM_GRACE:-5} =~ ^[0-9]{1,3}$ ]]; then
+		warm=1
+	else
+		echo "::warning title=rbe warm::RBE_WARM_URL, RBE_WARM_EVERY, RBE_WARM_SECONDS or RBE_WARM_GRACE unusable; this worker starts cold"
+	fi
+fi
 WORKER_TIER=${WORKER_TIER:-oss}
 case "$WORKER_TIER" in
 oss) NETNS=0 ;;
@@ -259,6 +283,21 @@ umask 077
 printf '%s' "$RBE_WORKER_TLS_CERT" | base64 -d >"$ROOT/pki/worker.pem"
 printf '%s' "$RBE_WORKER_TLS_KEY" | base64 -d >"$ROOT/pki/worker.key"
 umask 022
+
+# Warm set (RBE_WARM_URL): fetched in the background (warm-cas makes itself a
+# session leader) while isolation sets up and the selftest runs; NativeLink
+# starts once it ends (below). It runs as this user, before NativeLink and
+# before any action.
+warm_pid=
+if [ "$warm" = 1 ]; then
+	if ((10#${GITHUB_RUN_ID:-0} % ${RBE_WARM_EVERY:-1} == 0)); then
+		warm_end=$(($(date +%s) + ${RBE_WARM_SECONDS:-75}))
+		"$HERE/warm-cas" "$RBE_WARM_URL" "$STORE" "$warm_end" >"$RUNNER_TEMP/rbe-warm.out" 2>&1 &
+		warm_pid=$!
+	else
+		echo "rbe-warm: status=off reason=canary every=${RBE_WARM_EVERY:-1}"
+	fi
+fi
 
 # One action per two vCPUs. NativeLink ignores the client cert when
 # use_native_roots is set, so trust the system bundle via ca_file instead.
@@ -584,12 +623,35 @@ else
 	render
 fi
 
+if [ -n "${warm_pid:-}" ]; then
+	# Isolation is ready: the warm fetch gets RBE_WARM_GRACE more seconds (never
+	# past its own deadline), then SIGTERM (it reports what it placed and
+	# exits), then 10 s, then its whole session goes: registration waits at
+	# most the grace and the report.
+	stop=$(($(date +%s) + ${RBE_WARM_GRACE:-5}))
+	[ "$stop" -lt "$warm_end" ] || stop=$warm_end
+	while kill -0 "$warm_pid" 2>/dev/null && [ "$(date +%s)" -lt "$stop" ]; do sleep 0.5; done
+	kill -TERM "$warm_pid" 2>/dev/null || true
+	stop=$(($(date +%s) + 10))
+	while kill -0 "$warm_pid" 2>/dev/null && [ "$(date +%s)" -lt "$stop" ]; do sleep 0.5; done
+	# Only its own session (warm-cas, its chunk readers, their curl and zstd).
+	if kill -0 "$warm_pid" 2>/dev/null && [ "$(ps -o sid= -p "$warm_pid" | tr -d ' ')" = "$warm_pid" ]; then
+		pkill -KILL -s "$warm_pid" || true
+	fi
+	wait "$warm_pid" 2>/dev/null || true
+	grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out" ||
+		{ echo "rbe-warm: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-warm.out" || true; }
+fi
+# Each action's receipt is a debug line of local_worker: the boot-to-first-
+# action measurement below reads it. NativeLink clears the environment of the
+# actions it runs, so this reaches no action.
+NL_RUST_LOG="info,nativelink_worker::local_worker=debug"
 if [ "$ACTION_ISOLATION" = 1 ]; then
 	# The cert is in files from here on. NativeLink's persistent-worker spawn
 	# hands its own environment to the action: give it none of this step's.
-	env -i PATH="$PATH" HOME="$HOME" "$NL_BIN_DIR/nativelink" "$ROOT/worker.json" >"$ROOT/worker.log" 2>&1 &
+	env -i PATH="$PATH" HOME="$HOME" RUST_LOG="$NL_RUST_LOG" "$NL_BIN_DIR/nativelink" "$ROOT/worker.json" >"$ROOT/worker.log" 2>&1 &
 else
-	"$NL_BIN_DIR/nativelink" "$ROOT/worker.json" >"$ROOT/worker.log" 2>&1 &
+	RUST_LOG="$NL_RUST_LOG" "$NL_BIN_DIR/nativelink" "$ROOT/worker.json" >"$ROOT/worker.log" 2>&1 &
 fi
 nl=$!
 echo "worker $WORKER_NAME started (pid $nl, $slots slots, action isolation $ACTION_ISOLATION${canary:+, canary $canary})"
@@ -635,6 +697,39 @@ dev=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") p
 echo "rbe-pull: tier=$WORKER_TIER zstd=$wire_zstd rx_bytes=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null || echo ?)" \
 	"cas_bytes=$(du -sb "$STORE/content" | cut -f1) zstd_fallbacks=$(grep -c 'falling back to identity' "$ROOT/worker.log" || true)" \
 	"zstd_refused=$(grep -c 'refusing identity fallback' "$ROOT/worker.log" || true)"
+# Boot to first action: seconds from registration to the first action received
+# and to the first one executing (its inputs fetched), and the actions run.
+python3 - "$ROOT/worker.log" <<'PY' || true
+import re, sys
+from datetime import datetime
+ansi, ts = re.compile(r"\x1b\[[0-9;]*m"), re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{1,6})\d*Z")
+reg = recv = exe = None
+n = 0
+for ln in open(sys.argv[1], errors="replace"):
+    ln = ansi.sub("", ln)
+    m = ts.search(ln)
+    if not m:
+        continue
+    t = datetime.fromisoformat(m.group(1)).timestamp()
+    if reg is None and "Worker registered with scheduler" in ln:
+        reg = t
+    elif recv is None and "Received request to run action" in ln:
+        recv = t
+    elif "Executing command" in ln:
+        exe = t if exe is None else exe
+        n += 1
+d = lambda a, b: "-" if a is None or b is None else f"{a - b:.1f}"
+print(f"rbe-first-exec: registered_to_first_recv_s={d(recv, reg)} first_recv_to_first_exec_s={d(exe, recv)}"
+      f" registered_to_first_exec_s={d(exe, reg)} actions={n}")
+PY
+# The warm blobs still in the CAS (generation 0: NativeLink writes 1 and up),
+# re-hashed after the run. A mismatch means a CAS file was rewritten in place,
+# which nothing may do: the pin bump's go/no-go requires bad=0.
+if [ -n "${warm_pid:-}" ]; then
+	(cd "$STORE/content/d2" && find . -maxdepth 1 -type f -name '*-0' -print0 |
+		xargs -0 -r -n 64 -P "$(nproc)" sha256sum |
+		awk '{ n = $2; sub(".*/", "", n); c++; if (substr(n, 1, 64) != $1) bad++ } END { printf "rbe-warm-audit: checked=%d bad=%d\n", c, bad }') || true
+fi
 if [ "$ACTION_ISOLATION" = 1 ]; then
 	echo "slot egress (destination . protocol . port, packets): for the NETNS=1 decision"
 	sudo nft list set inet rbe_action slot_dst | sed -n '/elements/,/}/p' || true

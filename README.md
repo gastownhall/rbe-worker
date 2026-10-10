@@ -34,7 +34,13 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   hardening slice; `run` was removed).
 - **Log lines** other systems read: `isolation: <phase>`,
   `worker <name> started (pid …`, `RBE_ISOLATION_CANARY=`, `worker-env: `,
-  `rbe-pull: `.
+  `rbe-pull: `, `rbe-first-exec: `, and with a warm set `rbe-warm: ` and
+  `rbe-warm-audit: `.
+- **Warm set (optional, pool mode):** `RBE_WARM_URL` (an `https://` base
+  serving `current.json` and `chunks/`), `RBE_WARM_EVERY`,
+  `RBE_WARM_SECONDS`, `RBE_WARM_GRACE`. `worker/warm-cas` fetches it before
+  NativeLink starts and re-hashes every blob. Unset means a cold CAS; an
+  unusable value warns and starts cold, never exit 2.
 - **Exit codes:** 2 for configuration, 3 for drift in measure mode.
 
 ## Client contract
