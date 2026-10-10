@@ -4,7 +4,8 @@
 #   selftest [--quick]   --quick: configuration and one probe action (about a
 #                        second; nativelink-worker's ExecStartPre); without it
 #                        also the timeout path, a killed launcher, per-action
-#                        network (RBE_X_NETWORK) and NativeLink's worker config.
+#                        network (RBE_X_NETWORK), host tools (RBE_X_WORKER_ENV,
+#                        RBE_X_WORKER_ENV_BASE) and NativeLink's worker config.
 # Runs real actions through the real entrypoint as the worker user, in a
 # throwaway action directory under WORK_ROOT. Prints ok/FAIL lines and
 # "failures: N"; exit 1 on any failure.
@@ -44,7 +45,7 @@ for f in entry exec; do
 	check "$LIB/$f: root-owned, 0755, statically linked" \
 		bash -c "[[ \$(stat -c '%U %a' $LIB/$f) == 'root 755' ]] && file -b $LIB/$f | grep -q 'statically linked'"
 done
-for f in launch sweep selftest; do check "$LIB/$f: root 0755" test "$(stat -c '%U %a' "$LIB/$f")" = "root 755"; done
+for f in launch sweep selftest undeclared-host-tool; do check "$LIB/$f: root 0755" test "$(stat -c '%U %a' "$LIB/$f")" = "root 755"; done
 check "$CONF: root 0644" test "$(stat -c '%U %a' "$CONF")" = "root 644"
 check "/etc/sudoers.d/rbe-action: root 0440, parses" bash -c '[[ $(stat -c "%U %a" /etc/sudoers.d/rbe-action) == "root 440" ]] && visudo -cq'
 slots_ok() {
@@ -69,8 +70,14 @@ if ((!quick)); then
 	check "entrypoint is $LIB/entry" test "$(jq -r '.workers[0].local.entrypoint' "$j")" = "$LIB/entry"
 	check "timeout_handled_externally, max_action_timeout = BACKSTOP_S" \
 		test "$(jq -r '.workers[0].local | "\(.timeout_handled_externally) \(.max_action_timeout // .max_action_timeout_s)"' "$j")" = "true $BACKSTOP_S"
-	check "additional_environment: RBE_X_TIMEOUT_MS, RBE_X_SIDE_CHANNEL, RBE_X_NETWORK (property network)" \
-		test "$(jq -c '.workers[0].local.additional_environment' "$j")" = '{"RBE_X_TIMEOUT_MS":"timeout_millis","RBE_X_SIDE_CHANNEL":"side_channel_file","RBE_X_NETWORK":{"property":"network"}}'
+	check "additional_environment: RBE_X_TIMEOUT_MS, RBE_X_SIDE_CHANNEL, RBE_X_NETWORK, RBE_X_WORKER_ENV, RBE_X_WORKER_ENV_BASE" \
+		test "$(jq -c '.workers[0].local.additional_environment' "$j")" = '{"RBE_X_TIMEOUT_MS":"timeout_millis","RBE_X_SIDE_CHANNEL":"side_channel_file","RBE_X_NETWORK":{"property":"network"},"RBE_X_WORKER_ENV":{"property":"worker-env"},"RBE_X_WORKER_ENV_BASE":{"property":"worker-env-base"}}'
+	# worker-env-base goes with the launcher that hides what it leaves out: a
+	# worker that advertises worker-env (a pool worker) advertises it too.
+	if jq -e '.workers[0].local.platform_properties["worker-env"]' "$j" >/dev/null 2>&1; then
+		check "platform_properties: worker-env-base (sha256) beside worker-env" \
+			bash -c "jq -er '.workers[0].local.platform_properties[\"worker-env-base\"].values[0]' '$j' | grep -qE '^sha256:[0-9a-f]{64}\$'"
+	fi
 	check "no use_namespaces, use_mount_namespace, directory_cache" \
 		test "$(jq -c '.workers[0].local | [has("use_namespaces"), has("use_mount_namespace"), has("directory_cache")]' "$j")" = '[false,false,false]'
 fi
@@ -406,6 +413,59 @@ done'
 	else
 		check "Off (malformed): refused, never run (exit 125)" test "$(grep -c '^[ID] ' <<<"$out"):$(tail -n 1 <<<"$out")" = "0:exit 125"
 	fi
+	check "no slot process left" no_slot_procs
+
+	echo "# host tools: an action that sends only worker-env-base reaches no host go or dolt (exit 127); one that sends worker-env (or neither) keeps them; anything else is refused"
+	# Every go, gofmt and dolt the action's PATH and the Go roots offer, as
+	# "T <path> <exit status>", then its RBE_HOST_TOOLS and whether a Go root's
+	# pkg is empty. The PATH holds the image's (Bazel's test PATH
+	# /bin:/usr/bin:/usr/local/bin reaches Go through /usr/bin/go, the
+	# toolcache's) and the CI test PATH's /usr/local/go/bin.
+	tools_probe='for t in go gofmt dolt; do
+	for p in $(type -ap "$t") /usr/local/go/bin/"$t" /opt/hostedtoolcache/go/*/*/bin/"$t"; do
+		[ -e "$p" ] || continue
+		"$p" version >/dev/null 2>&1
+		echo "T $p $?"
+	done
+done | sort -u
+echo "E ${RBE_HOST_TOOLS:-}"
+[ -z "$(ls -A /usr/local/go/pkg 2>/dev/null)" ] && echo "P empty"'
+	tools_path=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+	tools_action() { # env assignments: the probe's output and "exit <status>"
+		local op d out rc
+		op=selftest-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+		d=$WORK_ROOT/$op
+		install -d -o "$WORKER_UID" -g "$WORKER_GID" -m 0755 "$d" "$d/work"
+		out=$(run_as_worker "$d/work" RBE_X_TIMEOUT_MS=60000 "$tools_path" "$@" "$LIB/entry" /bin/bash -c "$tools_probe" 2>&1)
+		rc=$?
+		rm -rf --one-file-system "$d"
+		printf '%s\nexit %s\n' "$out" "$rc"
+	}
+	# What runs on the host (as the worker) must run in an action that keeps
+	# the host's tools, and exit 127 in a base-only one, where also nothing
+	# the host lacks may appear.
+	host_ok=$(setpriv --reuid="$WORKER_UID" --regid="$WORKER_GID" --init-groups -- env -i "$tools_path" bash -c "$tools_probe" 2>/dev/null |
+		awk '$1 == "T" && $3 == 0 { print $2 }' | sort)
+	sha_a=sha256:$(printf '%064d' 0) sha_b=sha256:$(printf '%064d' 1)
+	out=$(tools_action "RBE_X_WORKER_ENV_BASE=$sha_b")
+	masked_bad=$(awk '$1 == "T" && $3 != 127 { print $2 }' <<<"$out")
+	check "base only: every host go, gofmt and dolt exits 127 (the host runs: ${host_ok//$'\n'/ })" \
+		test -z "$masked_bad" -a "$(awk '$1 == "T" { print $2 }' <<<"$out" | sort)" = "$host_ok"
+	check "base only: RBE_HOST_TOOLS=masked, the Go root's pkg empty, exit 0" \
+		test "$(grep -E '^(E|P|exit) ' <<<"$out" | tr '\n' ';')" = "E masked;P empty;exit 0;"
+	[[ -z $masked_bad ]] || echo "      host tool an action keyed on worker-env-base alone can run: ${masked_bad//$'\n'/ }"
+	for what in "worker-env and worker-env-base" "worker-env only" "neither"; do
+		case $what in
+		worker-env\ and*) out=$(tools_action "RBE_X_WORKER_ENV=$sha_a" "RBE_X_WORKER_ENV_BASE=$sha_b") ;;
+		worker-env\ only) out=$(tools_action "RBE_X_WORKER_ENV=$sha_a") ;;
+		*) out=$(tools_action) ;;
+		esac
+		check "$what: the host's go, gofmt and dolt run as on the host" \
+			test "$(awk '$1 == "T" && $3 == 0 { print $2 }' <<<"$out" | sort):$(grep '^E ' <<<"$out")" = "$host_ok:E "
+	done
+	out=$(tools_action "RBE_X_WORKER_ENV_BASE=sha256:nothex")
+	check "a malformed RBE_X_WORKER_ENV_BASE: refused, never run (exit 125)" \
+		test "$(grep -c '^T ' <<<"$out"):$(tail -n 1 <<<"$out")" = "0:exit 125"
 	check "no slot process left" no_slot_procs
 fi
 echo "failures: $fails"

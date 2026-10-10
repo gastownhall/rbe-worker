@@ -14,11 +14,12 @@
 #       free slot, hand the action's directories to the slot user, then exec
 #       unshare (new pid/mount/ipc[/net] namespaces; net with NETNS=1, or when
 #       the action asked for RBE_X_NETWORK=off).
-#   launch --ns <op> <slot> <rel> <timeout_s> <side_channel|-> <lock_fd> <host_net|-> <n> <env...> <argv...>
+#   launch --ns <op> <slot> <rel> <timeout_s> <side_channel|-> <lock_fd> <host_net|-> <host|masked> <n> <env...> <argv...>
 #       inner: pid 1 of those namespaces. host_net (the outer's
 #       /proc/self/ns/net link): pid 1 checks it is in another network
 #       namespace and brings up its loopback; -: the host's (filtered)
-#       network. Hides the worker's state, gives the
+#       network. masked: the host's go and dolt are hidden (an action keyed
+#       on worker-env-base alone, action_host_tools). Hides the worker's state, gives the
 #       action private /tmp, /var/tmp, HOME, /dev/shm (and TMPFS_DIRS), with
 #       ROOT_RO=1 makes everything else read-only, with MASK_SOCKETS=1
 #       world-writable sockets on /run unreachable, runs it as the slot user
@@ -36,6 +37,7 @@ CONF=/etc/rbe-west/rbe-action.env
 SELF=/usr/local/libexec/rbe-action/launch
 EXEC=/usr/local/libexec/rbe-action/exec
 RUN=/run/rbe-action
+HOST_TOOL_STUB=/usr/local/libexec/rbe-action/undeclared-host-tool
 
 die() { echo "rbe-action: $*" >&2; exit 125; }
 
@@ -85,6 +87,54 @@ action_netns() {
 	esac
 }
 
+# action_host_tools <RBE_X_WORKER_ENV> <RBE_X_WORKER_ENV_BASE>: masked if the
+# action's key names this worker's host through worker-env-base alone, host
+# otherwise. The values are the action's worker-env and worker-env-base
+# platform properties ("" when it has none; rbe-reexecution-design.md (c)).
+# worker-env-base is the host manifest without its go and dolt lines, so a
+# Go or dolt change on the workers moves no such key: an action keyed on it
+# alone gets no host go or dolt to use (mask_host_tools), and one that uses
+# them anyway fails (exit 127) instead of leaving a result a later host could
+# be served. worker-env names them: host. Neither property: host, as before.
+# Each value is empty or sha256:<64 hex>; anything else is refused. The
+# action can override both (its environment wins); naming worker-env only
+# gives back what its own key already names, and the products' policy tests
+# reject RBE_X_ in their Bazel files.
+action_host_tools() {
+	local re='^(sha256:[0-9a-f]{64})?$'
+	[[ $1 =~ $re && $2 =~ $re ]] || return 1
+	if [[ -n $2 && -z $1 ]]; then echo masked; else echo host; fi
+}
+
+# mask_host_tools: in pid 1's mount namespace, HOST_TOOL_STUB (exit 127,
+# saying why) bound over every go, gofmt and dolt an action can reach: in the
+# directories of an action's PATH, each resolved once (a symlink's target is
+# masked: Bazel's test PATH /bin:/usr/bin:/usr/local/bin reaches Go through
+# the image's /usr/bin/go -> /opt/hostedtoolcache/go/<v>/x64/bin/go, a Go that
+# worker-env does not even measure), and in each Go root's bin (/usr/local/go,
+# every toolcache Go). Each root's pkg (the compiler and linker binaries) gets
+# an empty read-only tmpfs. Stubs rather than hiding: a test that looks the
+# tool up still finds it and fails loudly, instead of skipping quietly.
+mask_host_tools() {
+	local d t f root
+	local -A seen=()
+	local -a roots=()
+	for root in /usr/local/go /opt/hostedtoolcache/go/*/*; do
+		if [[ -d $root/bin ]]; then roots+=("$root"); fi
+	done
+	for d in /usr/local/bin /usr/bin /bin /usr/local/sbin /usr/sbin /sbin "${roots[@]/%//bin}"; do
+		for t in go gofmt dolt; do
+			f=$(realpath -e -- "$d/$t" 2>/dev/null) || continue
+			[[ -z ${seen[$f]:-} ]] || continue
+			seen[$f]=1
+			mount --bind "$HOST_TOOL_STUB" "$f"
+		done
+	done
+	for root in "${roots[@]}"; do
+		if [[ -d $root/pkg ]]; then mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$root/pkg"; fi
+	done
+}
+
 outer() {
 	[[ ${1:-} =~ ^[0-9]+$ && $1 == "$PPID" ]] || die "sudo (pid ${1:-?}) exited during setup"
 	shift
@@ -128,6 +178,7 @@ outer() {
 	# (its Command environment wins), so they are validated, and stripped from
 	# the environment the action gets.
 	local i e secs="" sc=- ms="" net="" net_set=0 netns envs=() argv
+	local wenv="" wenv_set=0 wbase="" wbase_set=0 tools
 	for ((i = 2; i <= n + 1; i++)); do
 		e=${!i}
 		case $e in
@@ -136,6 +187,14 @@ outer() {
 		RBE_X_NETWORK=*)
 			((!net_set)) || die "RBE_X_NETWORK given twice"
 			net=${e#*=} net_set=1
+			;;
+		RBE_X_WORKER_ENV=*)
+			((!wenv_set)) || die "RBE_X_WORKER_ENV given twice"
+			wenv=${e#*=} wenv_set=1
+			;;
+		RBE_X_WORKER_ENV_BASE=*)
+			((!wbase_set)) || die "RBE_X_WORKER_ENV_BASE given twice"
+			wbase=${e#*=} wbase_set=1
 			;;
 		*) envs+=("$e") ;;
 		esac
@@ -146,6 +205,10 @@ outer() {
 	# only, on is this worker's default, and with NETNS=1 nothing it says
 	# gives it a network.
 	netns=$(action_netns "$net") || die "bad RBE_X_NETWORK (off, on or empty)"
+	tools=$(action_host_tools "$wenv" "$wbase") ||
+		die "bad RBE_X_WORKER_ENV or RBE_X_WORKER_ENV_BASE (empty or sha256:<64 hex>)"
+	# The action (a test's tripwire) can tell: beads' host_tools_masked_test.
+	if [[ $tools == masked ]]; then envs+=("RBE_HOST_TOOLS=masked"); fi
 	# NativeLink passes the action's timeout, or its own max_action_timeout
 	# (BACKSTOP_S, where it kills the launcher) when the action has none. So
 	# exactly BACKSTOP_S * 1000 ms means "none" (MAX_TIMEOUT_S), also when an
@@ -217,7 +280,7 @@ outer() {
 	# pdeathsig: if NativeLink kills sudo (cancel, backstop timeout), unshare
 	# dies, and --kill-child takes pid 1 and with it the whole pid namespace.
 	exec setpriv --pdeathsig KILL -- unshare "${ns[@]}" -- \
-		"$SELF" --ns "$op" "$slot" "$rel" "$secs" "$sc" "$lk" "$host_net" "${#envs[@]}" "${envs[@]}" "${argv[@]}"
+		"$SELF" --ns "$op" "$slot" "$rel" "$secs" "$sc" "$lk" "$host_net" "$tools" "${#envs[@]}" "${envs[@]}" "${argv[@]}"
 }
 
 # Everything back to the worker user, readable and removable, for upload and
@@ -233,8 +296,8 @@ fixup() {
 }
 
 inner() {
-	local op=$1 slot=$2 rel=$3 secs=$4 sc=$5 lk=$6 host_net=$7
-	shift 7
+	local op=$1 slot=$2 rel=$3 secs=$4 sc=$5 lk=$6 host_net=$7 host_tools=$8
+	shift 8
 	uid=$((SLOT_UID0 + slot)) op_dir=$WORK_ROOT/$op
 	local stash=$RUN/stash/$slot
 	trap 'fixup; exit 125' ERR
@@ -264,6 +327,16 @@ inner() {
 		if [[ -d $d ]]; then mount -t tmpfs -o mode=1777,size=16m,nosuid,nodev rbe-tmpfs "$d"; fi
 	done
 	mount -t mqueue -o nosuid,nodev,noexec rbe-mqueue /dev/mqueue
+	# masked (action_host_tools): no host go or dolt. Before ROOT_RO's remount
+	# below, which then leaves these mounts read-only too.
+	case $host_tools in
+	masked) mask_host_tools ;;
+	host) ;;
+	*)
+		echo "rbe-action: bad host_tools $host_tools" >&2
+		false
+		;;
+	esac
 	# ROOT_RO=1: the action can write only the mounts above. / and every
 	# other mount it can reach (/run, a data disk, ...) are read-only in here,
 	# whatever an image leaves world-writable (a shared tool cache), so no

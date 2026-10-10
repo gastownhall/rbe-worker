@@ -193,6 +193,15 @@ fi
 "$HERE/worker-env" >"$RUNNER_TEMP/worker-env.txt"
 WORKER_ENV=sha256:$(sha256sum <"$RUNNER_TEMP/worker-env.txt" | cut -d' ' -f1)
 echo "worker-env: $WORKER_ENV"
+# worker-env-base (rbe-reexecution-design.md (c)): the same manifest without its
+# go and dolt lines, a second key for actions that use neither (beads builds
+# with its go_sdk and tests with a hermetic dolt), so a Go or dolt change on
+# this host moves none of their keys. rbe-action-launch hides the host's go and
+# dolt from an action that sends only worker-env-base, so its result can never
+# have used them. Advertised only with action isolation on (render): without
+# the launcher nothing would hide them.
+WORKER_ENV_BASE=sha256:$(grep -v -E '^(go|dolt) ' "$RUNNER_TEMP/worker-env.txt" | sha256sum | cut -d' ' -f1)
+echo "worker-env-base: $WORKER_ENV_BASE (advertised with action isolation only)"
 "$HERE/worker-env" --raw >"$RUNNER_TEMP/worker-env.raw.txt" || :
 # A worker with any other toolchain (a new distribution release, a glibc,
 # library or tool release, Go or dolt) can serve no gascity action; security
@@ -307,9 +316,10 @@ isolation_undo() {
 }
 
 render() {
-	# zstd, read, casmax and work are read as $ARGS.named with today's values as
-	# defaults, so worker.json is byte-identical to before unless they change.
-	jq -n --arg host "grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}" --arg root "$ROOT" --arg store "$STORE" --arg name "$WORKER_NAME" --argjson slots "$slots" --arg tier "${WORKER_TIER:-oss}" --arg worker_env "$WORKER_ENV" --argjson zstd "${wire_zstd:-false}" --arg read "${ZSTD_READ_URL:-grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}}" --argjson casmax "${CAS_MAX_BYTES:-150000000000}" --arg work "${WORK:-$ROOT/work}" --argjson isolation "$isolation" '
+	# zstd, read, casmax, work and worker_env_base are read as $ARGS.named with
+	# today's values as defaults, so worker.json is byte-identical to before
+	# unless they change.
+	jq -n --arg host "grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}" --arg root "$ROOT" --arg store "$STORE" --arg name "$WORKER_NAME" --argjson slots "$slots" --arg tier "${WORKER_TIER:-oss}" --arg worker_env "$WORKER_ENV" --argjson zstd "${wire_zstd:-false}" --arg read "${ZSTD_READ_URL:-grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}}" --argjson casmax "${CAS_MAX_BYTES:-150000000000}" --arg work "${WORK:-$ROOT/work}" --arg worker_env_base "${WORKER_ENV_BASE:-}" --argjson isolation "$isolation" '
   { cert_file: ($root + "/pki/worker.pem"), key_file: ($root + "/pki/worker.key"),
     ca_file: "/etc/ssl/certs/ca-certificates.crt" } as $tls |
   (if $tier == "fork" then "oss-fork" else "oss" end) as $cas_instance |
@@ -347,12 +357,16 @@ render() {
       upload_action_result: (if $tier == "fork" then { upload_ac_results_strategy: "never" } else { ac_store: "REMOTE_AC" } end),
       work_directory: ($ARGS.named.work // ($root + "/work")),
       max_inflight_tasks: $slots,
-      platform_properties: {
+      # worker-env-base only through the launcher (isolation), which hides the
+      # host go and dolt it leaves out; a fallback to no isolation drops it.
+      platform_properties: ({
         OSFamily: { values: ["linux"] },
         "container-image": { values: [""] },
         ISA: { values: ["x86_64"] },
         "worker-env": { values: [$worker_env] }
-      } } + $isolation) } ],
+      } + (if ($isolation | length) > 0 and ($ARGS.named.worker_env_base // "") != "" then
+        { "worker-env-base": { values: [$ARGS.named.worker_env_base] } } else {} end))
+    } + $isolation) } ],
     servers: []
   }' >"$ROOT/worker.json"
 }
@@ -394,6 +408,7 @@ isolate() {
 	sudo install -m 0755 "$HERE/rbe-action-launch" "$LIB/launch"
 	sudo install -m 0755 "$HERE/rbe-action-sweep" "$LIB/sweep"
 	sudo install -m 0755 "$HERE/rbe-action-selftest" "$LIB/selftest"
+	sudo install -m 0755 "$HERE/undeclared-host-tool" "$LIB/undeclared-host-tool"
 	# No directory but the action's own (its outputs, /tmp, /var/tmp, HOME,
 	# /dev/shm, TMPFS_DIRS: private per action) may be writable by every
 	# action, or one could leave files for a later one. The image's
@@ -534,10 +549,14 @@ if [ "$ACTION_ISOLATION" = 1 ]; then
 	# RBE_X_NETWORK: the action's `network` platform property ("" without
 	# one; infra README "Per-action network"). off: the launcher gives it
 	# loopback only, as NETNS=1 does for every fork action; on or none: this
-	# tier's default. The fork tier ignores it.
+	# tier's default. The fork tier ignores it. RBE_X_WORKER_ENV and
+	# RBE_X_WORKER_ENV_BASE: the action's worker-env and worker-env-base;
+	# with the base alone the launcher hides the host's go and dolt
+	# (rbe-action-launch action_host_tools).
 	isolation='{ "entrypoint": "/usr/local/libexec/rbe-action/entry", "timeout_handled_externally": true, "max_action_timeout": 1260,
 		"additional_environment": { "RBE_X_TIMEOUT_MS": "timeout_millis", "RBE_X_SIDE_CHANNEL": "side_channel_file",
-			"RBE_X_NETWORK": { "property": "network" } } }'
+			"RBE_X_NETWORK": { "property": "network" },
+			"RBE_X_WORKER_ENV": { "property": "worker-env" }, "RBE_X_WORKER_ENV_BASE": { "property": "worker-env-base" } } }'
 	if [ "$canary" = selected ]; then
 		# A subshell: set -e works there (it would not in a condition), and a
 		# failure ends it, not the worker. The phase file says where.

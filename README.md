@@ -42,6 +42,13 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   NativeLink starts and re-hashes every blob. Unset means a cold CAS; an
   unusable value warns and starts cold, never exit 2.
 - **Exit codes:** 2 for configuration, 3 for drift in measure mode.
+- **Platform properties:** `worker-env` (sha256 of the measured manifest), and,
+  only with action isolation on, `worker-env-base` (sha256 of the manifest
+  without its `go` and `dolt` lines). An action that sends only
+  `worker-env-base` gets no host `go`, `gofmt` or `dolt`: the launcher binds
+  `worker/undeclared-host-tool` (exit 127) over every one it could reach, and
+  exports `RBE_HOST_TOOLS=masked`. Schedulers must declare both properties
+  `exact` (rbe-reexecution-design.md (c)).
 
 ## Client contract
 
