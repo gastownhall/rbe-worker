@@ -627,24 +627,35 @@ if [ -n "${warm_pid:-}" ]; then
 	# Isolation is ready: the warm fetch gets RBE_WARM_GRACE more seconds (never
 	# past its own deadline), then SIGTERM (it reports what it placed and
 	# exits), then 10 s, then its whole session goes: registration waits at
-	# most the grace and the report.
+	# most the grace and the report. Its session id is read now, while it runs
+	# (it made itself a session leader at start).
+	warm_sid=$(ps -o sid= -p "$warm_pid" | tr -d ' ' || true)
 	stop=$(($(date +%s) + ${RBE_WARM_GRACE:-5}))
 	[ "$stop" -lt "$warm_end" ] || stop=$warm_end
 	while kill -0 "$warm_pid" 2>/dev/null && [ "$(date +%s)" -lt "$stop" ]; do sleep 0.5; done
 	kill -TERM "$warm_pid" 2>/dev/null || true
 	stop=$(($(date +%s) + 10))
 	while kill -0 "$warm_pid" 2>/dev/null && [ "$(date +%s)" -lt "$stop" ]; do sleep 0.5; done
-	# Only its own session (warm-cas, its chunk readers, their curl and zstd).
-	if kill -0 "$warm_pid" 2>/dev/null && [ "$(ps -o sid= -p "$warm_pid" | tr -d ' ')" = "$warm_pid" ]; then
-		pkill -KILL -s "$warm_pid" || true
+	# Its whole session (warm-cas, its chunk readers, their curl and zstd),
+	# also when warm-cas itself has exited and left a member behind. Only if it
+	# was a session of its own: the kernel keeps a session id from reuse while
+	# any member lives, so the id names nothing else.
+	if [ "$warm_sid" = "$warm_pid" ]; then
+		pkill -KILL -s "$warm_sid" || true
 	fi
 	wait "$warm_pid" 2>/dev/null || true
 	grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out" ||
 		{ echo "rbe-warm: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-warm.out" || true; }
 fi
 # Each action's receipt is a debug line of local_worker: the boot-to-first-
-# action measurement below reads it. NativeLink clears the environment of the
-# actions it runs, so this reaches no action.
+# action measurement below reads it. NativeLink 1.7.1 clears the environment
+# of every action it spawns (running_actions_manager: env_clear), so actions
+# never see this filter. Its persistent-worker spawn (supports-workers=1) does
+# pass NativeLink's own environment on: with isolation that spawn is the
+# entrypoint in WORK_ROOT, which the launcher refuses (exit 125) before any
+# action code runs; without isolation (the rollback) such an action already
+# gets this step's whole environment. Neither product sends persistent-worker
+# actions remotely (infra README "Action isolation").
 NL_RUST_LOG="info,nativelink_worker::local_worker=debug"
 if [ "$ACTION_ISOLATION" = 1 ]; then
 	# The cert is in files from here on. NativeLink's persistent-worker spawn

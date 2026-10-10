@@ -3,9 +3,11 @@ package scripts_test
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +30,13 @@ type warmMember struct {
 	data     []byte
 	typeflag byte
 	link     string
+}
+
+// incompressible returns n pseudo-random bytes: a chunk that zstd cannot shrink.
+func incompressible(n int) []byte {
+	b := make([]byte, n)
+	rand.New(rand.NewSource(int64(n))).Read(b)
+	return b
 }
 
 func blobName(data []byte) string {
@@ -103,8 +112,20 @@ func warmServer(t *testing.T, manifest any, chunks map[string][]byte, delay time
 
 func runWarmCAS(t *testing.T, url, store string, deadline time.Time) (string, time.Duration) {
 	t.Helper()
+	return runWarmCASWith(t, nil, url, store, deadline)
+}
+
+// warmEnv is warm-cas's environment in these tests: no free-space margin, so
+// the result does not depend on the runner's disk.
+func warmEnv() []string { return append(os.Environ(), "RBE_WARM_FREE_MARGIN=0") }
+
+// runWarmCASWith runs warm-cas under prefix (e.g. prlimit) when it is given.
+func runWarmCASWith(t *testing.T, prefix []string, url, store string, deadline time.Time) (string, time.Duration) {
+	t.Helper()
 	start := time.Now()
-	cmd := exec.Command("python3", filepath.Join(repoRoot(t), warmCAS), url, store, strconv.FormatInt(deadline.Unix(), 10))
+	args := append(append([]string(nil), prefix...), "python3", filepath.Join(repoRoot(t), warmCAS), url, store, strconv.FormatInt(deadline.Unix(), 10))
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = warmEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("warm-cas must exit 0 when it cannot warm: %v\n%s", err, out)
@@ -124,11 +145,11 @@ func TestWarmCASPlacesOnlyVerifiedBlobs(t *testing.T) {
 		{name: "d2", typeflag: tar.TypeDir},
 		{name: blobName(good2), data: good2, typeflag: tar.TypeReg},
 	})
-	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": 1, "zbytes": len(chunk)}}}
+	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": 160000, "zbytes": len(chunk)}}}
 	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 0)
 	store := t.TempDir()
 	out, _ := runWarmCAS(t, srv.URL+"/w", store, time.Now().Add(30*time.Second))
-	if !regexp.MustCompile(`(?m)^rbe-warm: set=` + set + ` status=partial blobs=2 bytes=160000 rejected=1 skipped=4 chunks=1/1 `).MatchString(out) {
+	if !regexp.MustCompile(`(?m)^rbe-warm: set=` + set + ` status=partial blobs=2 bytes=160000 rejected=1 skipped=4 chunks=1/1 missing=0 stopped=0 `).MatchString(out) {
 		t.Fatalf("warm-cas output:\n%s", out)
 	}
 	entries, _ := os.ReadDir(filepath.Join(store, "content", "d2"))
@@ -177,7 +198,7 @@ func TestWarmCASRefusesABadManifest(t *testing.T) {
 
 func TestWarmCASStopsAtItsDeadline(t *testing.T) {
 	set := "0123456789abcdef0123456789abcdef"
-	blob := bytes.Repeat([]byte("c"), 1<<20)
+	blob := incompressible(1 << 20) // so the slow server really is slow
 	chunk := zstdChunk(t, []warmMember{{name: blobName(blob), data: blob, typeflag: tar.TypeReg}})
 	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": len(blob), "zbytes": len(chunk)}}}
 	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 2*time.Second)
@@ -195,12 +216,13 @@ func TestWarmCASStopsAtItsDeadline(t *testing.T) {
 // RBE_WARM_GRACE): warm-cas reports what it placed and exits at once.
 func TestWarmCASStopsAtSIGTERM(t *testing.T) {
 	set := "0123456789abcdef0123456789abcdef"
-	blob := bytes.Repeat([]byte("d"), 1<<20)
+	blob := incompressible(1 << 20) // so the slow server really is slow
 	chunk := zstdChunk(t, []warmMember{{name: blobName(blob), data: blob, typeflag: tar.TypeReg}})
 	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": len(blob), "zbytes": len(chunk)}}}
 	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 2*time.Second)
 	store := t.TempDir()
 	cmd := exec.Command("python3", filepath.Join(repoRoot(t), warmCAS), srv.URL+"/w", store, strconv.FormatInt(time.Now().Add(60*time.Second).Unix(), 10))
+	cmd.Env = warmEnv()
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
@@ -239,14 +261,15 @@ func TestBlacksmithWorkerWarmWiring(t *testing.T) {
 		`if [ -n "${RBE_WARM_URL:-}" ] && [ "$WORKER_MODE" = pool ]; then`,
 		`"$HERE/warm-cas" "$RBE_WARM_URL" "$STORE" "$warm_end" >"$RUNNER_TEMP/rbe-warm.out" 2>&1 &`,
 		`kill -TERM "$warm_pid" 2>/dev/null || true`,
-		`[ "$(ps -o sid= -p "$warm_pid" | tr -d ' ')" = "$warm_pid" ]`,
+		`warm_sid=$(ps -o sid= -p "$warm_pid" | tr -d ' ' || true)`,
+		`if [ "$warm_sid" = "$warm_pid" ]; then`,
 		`env -i PATH="$PATH" HOME="$HOME" RUST_LOG="$NL_RUST_LOG" "$NL_BIN_DIR/nativelink"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("%s: missing %q", rbeWorkerScript, want)
 		}
 	}
-	wait, start := strings.Index(s, "pkill -KILL -s"), strings.Index(s, `"$NL_BIN_DIR/nativelink" "$ROOT/worker.json"`)
+	wait, start := strings.Index(s, `pkill -KILL -s "$warm_sid"`), strings.Index(s, `"$NL_BIN_DIR/nativelink" "$ROOT/worker.json"`)
 	if wait < 0 || start < 0 || wait > start {
 		t.Errorf("the warm wait must come before NativeLink starts")
 	}
@@ -264,4 +287,154 @@ func TestBlacksmithWorkerWarmWiring(t *testing.T) {
 	if !strings.Contains(w, `"curl", "-fsS", "--ipv4",`) {
 		t.Error("warm-cas must fetch over IPv4")
 	}
+}
+
+// A write can be short (a full disk, a file size limit): warm-cas must never
+// place a truncated file under a verified name. Under prlimit --fsize the
+// second blob's write is cut at the limit; the chunk stops there (stopped=1,
+// not an integrity reject), and only the blob that fitted is placed.
+func TestWarmCASShortWriteNeverPlacesATruncatedBlob(t *testing.T) {
+	prlimit, err := exec.LookPath("prlimit")
+	if err != nil {
+		t.Skip("prlimit (util-linux, on the runner image) is not installed")
+	}
+	set := "0123456789abcdef0123456789abcdef"
+	small, big, after := bytes.Repeat([]byte("s"), 70000), bytes.Repeat([]byte("b"), 150000), bytes.Repeat([]byte("t"), 80000)
+	chunk := zstdChunk(t, []warmMember{
+		{name: blobName(small), data: small, typeflag: tar.TypeReg},
+		{name: blobName(big), data: big, typeflag: tar.TypeReg},
+		{name: blobName(after), data: after, typeflag: tar.TypeReg},
+	})
+	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": 300000, "zbytes": len(chunk)}}}
+	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 0)
+	store := t.TempDir()
+	out, _ := runWarmCASWith(t, []string{prlimit, "--fsize=100000"}, srv.URL+"/w", store, time.Now().Add(30*time.Second))
+	if !strings.Contains(out, " status=partial blobs=1 bytes=70000 rejected=0 ") || !strings.Contains(out, " stopped=1 ") {
+		t.Errorf("warm-cas output:\n%s", out)
+	}
+	d2 := filepath.Join(store, "content", "d2")
+	entries, _ := os.ReadDir(d2)
+	for _, e := range entries {
+		info, _ := e.Info()
+		size, _ := strconv.ParseInt(strings.Split(e.Name(), "-")[1], 10, 64)
+		if info.Size() != size {
+			t.Errorf("%s holds %d bytes, its name says %d", e.Name(), info.Size(), size)
+		}
+	}
+	if len(entries) != 1 || entries[0].Name() != blobName(small)+"-0" {
+		t.Errorf("content/d2 = %v, want only %s-0", entries, blobName(small))
+	}
+	if left, _ := os.ReadDir(filepath.Join(store, "tmp", "d2")); len(left) != 0 {
+		t.Errorf("staging left behind: %v", left)
+	}
+}
+
+// A chunk may not place more bytes than the manifest declared for it.
+func TestWarmCASKeepsToTheManifestsBytes(t *testing.T) {
+	set := "0123456789abcdef0123456789abcdef"
+	a, b := bytes.Repeat([]byte("a"), 70000), bytes.Repeat([]byte("b"), 90000)
+	chunk := zstdChunk(t, []warmMember{{name: blobName(a), data: a, typeflag: tar.TypeReg}, {name: blobName(b), data: b, typeflag: tar.TypeReg}})
+	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{{"name": set + "/00.tar.zst", "raw_bytes": 70000, "zbytes": len(chunk)}}}
+	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 0)
+	out, _ := runWarmCAS(t, srv.URL+"/w", t.TempDir(), time.Now().Add(30*time.Second))
+	if !strings.Contains(out, " status=partial blobs=1 bytes=70000 rejected=1 ") {
+		t.Errorf("warm-cas output:\n%s", out)
+	}
+}
+
+// A chunk that cannot be fetched (an expired chunk's 404) is missing, not an
+// integrity reject: W2's rejected=0 gate measures integrity alone.
+func TestWarmCASCountsAMissingChunkApart(t *testing.T) {
+	set := "0123456789abcdef0123456789abcdef"
+	a := bytes.Repeat([]byte("a"), 70000)
+	chunk := zstdChunk(t, []warmMember{{name: blobName(a), data: a, typeflag: tar.TypeReg}})
+	man := map[string]any{"v": 1, "set": set, "chunks": []map[string]any{
+		{"name": set + "/00.tar.zst", "raw_bytes": 70000, "zbytes": len(chunk)},
+		{"name": set + "/01.tar.zst", "raw_bytes": 70000, "zbytes": 100},
+	}}
+	srv, _ := warmServer(t, man, map[string][]byte{set + "/00.tar.zst": chunk}, 0)
+	out, _ := runWarmCAS(t, srv.URL+"/w", t.TempDir(), time.Now().Add(30*time.Second))
+	if !strings.Contains(out, " status=partial blobs=1 bytes=70000 rejected=0 skipped=0 chunks=2/2 missing=1 stopped=0 ") {
+		t.Errorf("warm-cas output:\n%s", out)
+	}
+}
+
+// The script's warm wait, run as written: a warm-cas that ignores SIGTERM and
+// keeps a forked child, or one that exits at SIGTERM but leaves its child
+// behind. Either way registration waits at most RBE_WARM_GRACE plus the 10 s
+// report window, and nothing of the warm session survives.
+func TestBlacksmithWorkerWarmWaitIsBounded(t *testing.T) {
+	block := regexp.MustCompile(`(?s)\nif \[ -n "\$\{warm_pid:-\}" \]; then\n\t# Isolation is ready.*?\nfi\n`).FindString(readFile(t, repoRoot(t), rbeWorkerScript))
+	if block == "" {
+		t.Fatalf("%s: no warm wait block", rbeWorkerScript)
+	}
+	for _, c := range []struct {
+		name       string
+		leaderTerm string // what the fake warm-cas does at SIGTERM
+	}{
+		{"ignores SIGTERM", "signal.SIG_IGN"},
+		{"exits at SIGTERM, child stays", "lambda *_: os._exit(0)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "fake-warm-cas")
+			// The child ignores SIGTERM too and records its pid.
+			prog := "import os, signal, sys, time\nos.setsid()\n" +
+				"if os.fork() == 0:\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" +
+				"    open(sys.argv[1], 'w').write(str(os.getpid()))\n    time.sleep(600)\n    os._exit(0)\n" +
+				"signal.signal(signal.SIGTERM, " + c.leaderTerm + ")\ntime.sleep(600)\n"
+			if err := os.WriteFile(fake, []byte(prog), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			childFile := filepath.Join(dir, "child.pid")
+			script := "set -euo pipefail\nRUNNER_TEMP=" + dir + "\nRBE_WARM_GRACE=1\n" +
+				"python3 " + fake + " " + childFile + " >\"$RUNNER_TEMP/rbe-warm.out\" 2>&1 &\nwarm_pid=$!\n" +
+				"warm_end=$(($(date +%s) + 75))\n" +
+				"for _ in $(seq 50); do [ -s " + childFile + " ] && break; sleep 0.1; done\n" +
+				"echo \"leader=$warm_pid\"\nSECONDS=0" + block + "echo \"waited=$SECONDS\"\n"
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			start := time.Now()
+			out, err := exec.CommandContext(ctx, "bash", "-c", script).CombinedOutput()
+			took := time.Since(start)
+			if err != nil {
+				t.Fatalf("wait block: %v\n%s", err, out)
+			}
+			// Grace 1 s plus 10 s, with one 0.5 s poll of slack each.
+			if took > 13*time.Second {
+				t.Errorf("registration waited %v, want at most RBE_WARM_GRACE + 10 s\n%s", took, out)
+			}
+			if !strings.Contains(string(out), "rbe-warm: status=error reason=no-report") {
+				t.Errorf("no report line:\n%s", out)
+			}
+			leader := regexp.MustCompile(`leader=(\d+)`).FindStringSubmatch(string(out))
+			child, _ := os.ReadFile(childFile)
+			if leader == nil || len(child) == 0 {
+				t.Fatalf("leader %v, child %q\n%s", leader, child, out)
+			}
+			for _, pid := range []string{leader[1], string(child)} {
+				deadline := time.Now().Add(3 * time.Second)
+				for alive(pid) && time.Now().Before(deadline) {
+					time.Sleep(50 * time.Millisecond)
+				}
+				if alive(pid) {
+					t.Errorf("pid %s of the warm session is still running", pid)
+				}
+			}
+			if s, _ := exec.Command("pgrep", "-s", leader[1]).Output(); len(s) != 0 {
+				t.Errorf("session %s still has members: %s", leader[1], s)
+			}
+		})
+	}
+}
+
+// alive: the process exists and is not a zombie.
+func alive(pid string) bool {
+	b, err := os.ReadFile("/proc/" + strings.TrimSpace(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))
+	return len(f) > 0 && f[0] != "Z" && f[0] != "X"
 }
