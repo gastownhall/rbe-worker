@@ -30,9 +30,11 @@
 # The action controls its environment, argv and working directory: they are
 # data here. Nothing from them is evaluated, used as a path for a privileged
 # operation, or trusted as configuration. Exit 125: the launcher failed.
-# -E: the ERR trap of pid 1 (inner) also fires inside its functions
-# (mask_host_tools), so any failure there fixes up and exits 125.
-set -Eeuo pipefail
+# No -E: inner's ERR trap (fixup; exit 125) must not be inherited by command
+# and process substitutions (the MASK_SOCKETS walk's `< <(find ...)`), where it
+# would run fixup in a background subshell under a running action. Functions
+# pid 1 calls return non-zero instead (mask_host_tools), and the caller fails.
+set -euo pipefail
 umask 022
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 CONF=/etc/rbe-west/rbe-action.env
@@ -116,24 +118,25 @@ action_host_tools() {
 # prints (its header says what and why). isolate() writes the plan once to
 # HOST_TOOLS_PLAN; without one (another installer) it is computed here. Stubs
 # rather than hiding: a test that looks the tool up still finds it and fails
-# loudly, instead of skipping quietly. A stale plan entry fails the mount, and
-# with it the action (exit 125): never an unmasked run.
+# loudly, instead of skipping quietly. A stale plan entry fails the mount, the
+# function returns 1, and pid 1's caller fails the action (ERR trap: fixup,
+# exit 125): never an unmasked run.
 mask_host_tools() {
 	local plan kind p
 	if [[ -f $HOST_TOOLS_PLAN && ! -L $HOST_TOOLS_PLAN && $(stat -c '%u %a' "$HOST_TOOLS_PLAN") =~ ^0\ [0-7][0145][0145]$ ]]; then
-		plan=$(<"$HOST_TOOLS_PLAN")
+		plan=$(<"$HOST_TOOLS_PLAN") || return 1
 	else
-		plan=$("$HOST_TOOLS_GEN")
+		plan=$("$HOST_TOOLS_GEN") || return 1
 	fi
 	while read -r kind p; do
 		[[ -n $kind ]] || continue
-		[[ $p == /* && $p != *..* ]] || { echo "rbe-action: bad host-tools plan line: $kind $p" >&2; false; }
+		[[ $p == /* && $p != *..* ]] || { echo "rbe-action: bad host-tools plan line: $kind $p" >&2; return 1; }
 		case $kind in
-		bind) mount --bind "$HOST_TOOL_STUB" "$p" ;;
-		tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" ;;
+		bind) mount --bind "$HOST_TOOL_STUB" "$p" || return 1 ;;
+		tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" || return 1 ;;
 		*)
 			echo "rbe-action: bad host-tools plan line: $kind $p" >&2
-			false
+			return 1
 			;;
 		esac
 	done <<<"$plan"
@@ -334,7 +337,7 @@ inner() {
 	# masked (action_host_tools): no host go or dolt. Before ROOT_RO's remount
 	# below, which then leaves these mounts read-only too.
 	case $host_tools in
-	masked) mask_host_tools ;;
+	masked) mask_host_tools || { echo "rbe-action: host-tools mask failed" >&2; false; } ;;
 	host) ;;
 	*)
 		echo "rbe-action: bad host_tools $host_tools" >&2

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -180,19 +182,18 @@ func TestRBEActionHostTools(t *testing.T) {
 		`if [[ $tools == masked ]]; then envs+=("RBE_HOST_TOOLS=masked"); fi`,
 		// pid 1 masks before ROOT_RO's remount walk, and refuses anything else;
 		// -E: a failed mount there hits the ERR trap (fixup, exit 125).
-		"\tmasked) mask_host_tools ;;\n\thost) ;;\n",
-		"set -Eeuo pipefail\n",
+		"\tmasked) mask_host_tools || { echo \"rbe-action: host-tools mask failed\" >&2; false; } ;;\n\thost) ;;\n",
 		// The plan isolate() wrote (root's, not group/world-writable), or the
 		// generator's output, mounted line by line.
 		"HOST_TOOLS_PLAN=/etc/rbe-west/rbe-action-host-tools\n",
-		`bind) mount --bind "$HOST_TOOL_STUB" "$p" ;;`,
-		`tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" ;;`,
+		`bind) mount --bind "$HOST_TOOL_STUB" "$p" || return 1 ;;`,
+		`tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" || return 1 ;;`,
 	} {
 		if !strings.Contains(launch, want) {
 			t.Errorf("rbe-action-launch missing %q", want)
 		}
 	}
-	if mask, walk := strings.Index(launch, "\tmasked) mask_host_tools ;;"), strings.Index(launch, "if [[ $ROOT_RO == 1 ]]; then mount --bind \"$RUN\" \"$RUN\"; fi"); mask < 0 || walk < mask {
+	if mask, walk := strings.Index(launch, "\tmasked) mask_host_tools ||"), strings.Index(launch, "if [[ $ROOT_RO == 1 ]]; then mount --bind \"$RUN\" \"$RUN\"; fi"); mask < 0 || walk < mask {
 		t.Errorf("rbe-action-launch: mask_host_tools must run before the ROOT_RO walk (mask %d, walk %d)", mask, walk)
 	}
 
@@ -241,6 +242,62 @@ func TestRBEActionHostTools(t *testing.T) {
 	} {
 		if !strings.Contains(selftest, want) {
 			t.Errorf("rbe-action-selftest missing %q", want)
+		}
+	}
+}
+
+// TestRBEActionMaskFailureExits125: a mask mount that fails (a stale plan
+// entry) fails the action through pid 1's ERR trap, exit 125, before it runs:
+// mask_host_tools returns 1 on any failed read or mount and its caller fails.
+// The launcher must not use set -E: with it, inner's ERR trap (fixup; exit 125)
+// is inherited by process substitutions such as the MASK_SOCKETS walk's
+// `< <(find ...)`, and a find that fails there (a host mount under /run/lock,
+// hidden by the action's own tmpfs) ran fixup in the background under a
+// running action (review of 26a9c59; reproduced in the privileged harness:
+// failures: 5 with -E, 0 without).
+func TestRBEActionMaskFailureExits125(t *testing.T) {
+	launch := readFile(t, repoRoot(t), "worker/rbe-action-launch")
+	if strings.Contains(launch, "set -E") || !strings.Contains(launch, "\nset -euo pipefail\n") {
+		t.Fatalf("rbe-action-launch must run set -euo pipefail, never -E (errtrace)")
+	}
+	fn := regexp.MustCompile(`(?s)\nmask_host_tools\(\) \{\n.*?\n\}\n`).FindString(launch)
+	call := regexp.MustCompile(`\tmasked\) (mask_host_tools \|\| \{[^\n]*\}) ;;`).FindStringSubmatch(launch)
+	if fn == "" || call == nil {
+		t.Fatal("rbe-action-launch: no mask_host_tools() or its masked) call")
+	}
+	dir := t.TempDir()
+	gen := dir + "/gen"
+	if err := os.WriteFile(gen, []byte("#!/bin/sh\necho 'bind /usr/bin/go'\necho 'bind /nonexistent/go'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		mount string
+		code  int
+	}{
+		"every mount fails":      {`mount() { return 32; }`, 125},
+		"the second mount fails": {`mount() { [[ $3 != /nonexistent/go ]] || return 32; }`, 125},
+		"every mount succeeds":   {`mount() { :; }`, 0},
+	} {
+		// pid 1's shape: errexit, an ERR trap set inside the function, then
+		// the masked) call, then the action.
+		script := "set -euo pipefail\nHOST_TOOL_STUB=/stub HOST_TOOLS_GEN=" + gen + " HOST_TOOLS_PLAN=" + dir + "/no-plan\n" +
+			c.mount + "\n" + fn + "inner() {\n\ttrap 'echo fixup; exit 125' ERR\n\t" + call[1] + "\n\techo ACTION RAN\n}\ninner\n"
+		cmd := exec.Command("bash", "--noprofile", "--norc", "-c", script)
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		out, err := cmd.CombinedOutput()
+		code := 0
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		ran := strings.Contains(string(out), "ACTION RAN")
+		if code != c.code || ran != (c.code == 0) {
+			t.Errorf("%s: exit %d ran=%v, want exit %d ran=%v\n%s", name, code, ran, c.code, c.code == 0, out)
+		}
+		if c.code == 125 && !strings.Contains(string(out), "rbe-action: host-tools mask failed") {
+			t.Errorf("%s: no failure message:\n%s", name, out)
 		}
 	}
 }
