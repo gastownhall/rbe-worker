@@ -1,0 +1,9 @@
+#!/bin/sh
+# undeclared-host-tool: bound over the host's go, gofmt and dolt inside an action
+# that sends only the worker-env-base platform property (rbe-action-launch,
+# rbe-reexecution-design.md (c)). That action's key names the worker host
+# without its go and dolt, so a result that used them could be served after
+# they change: the action must not reach them. Installed root:root 0755 at
+# /usr/local/libexec/rbe-action/undeclared-host-tool.
+echo "rbe-west: host $(basename "$0") is outside this action's key (worker-env-base); send worker-env or use the hermetic tool" >&2
+exit 127

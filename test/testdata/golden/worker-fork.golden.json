@@ -85,6 +85,12 @@
           "RBE_X_SIDE_CHANNEL": "side_channel_file",
           "RBE_X_NETWORK": {
             "property": "network"
+          },
+          "RBE_X_WORKER_ENV": {
+            "property": "worker-env"
+          },
+          "RBE_X_WORKER_ENV_BASE": {
+            "property": "worker-env-base"
           }
         }
       }

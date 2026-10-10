@@ -47,7 +47,7 @@ func TestRBEWorkerScriptPathsResolveInTree(t *testing.T) {
 			t.Fatalf("%s: prelude %q missing %q", rbeWorkerScript, prelude, want)
 		}
 	}
-	siblings := []string{"worker-env", "worker-env-drift", "rbe-action-entry.c", "rbe-action-launch", "rbe-action-selftest", "rbe-action-sweep"}
+	siblings := []string{"worker-env", "worker-env-drift", "rbe-action-entry.c", "rbe-action-launch", "rbe-action-selftest", "rbe-action-sweep", "undeclared-host-tool", "rbe-action-host-tools"}
 	script2 := prelude + "echo \"HERE=$HERE\"\necho \"RBE_PRODUCT_ROOT=$RBE_PRODUCT_ROOT\"\n"
 	for _, s := range siblings {
 		script2 += fmt.Sprintf(`echo "HERE/%s=$HERE/%s"`+"\n", s, s)
@@ -90,7 +90,7 @@ func TestRBEWorkerScriptIsolationSwitch(t *testing.T) {
 		"plain_slots=$slots\nisolation='{}'\nif [ \"$ACTION_ISOLATION\" = 1 ]; then\n",
 		// The isolation keys are merged into the worker config only when on, so
 		// the rollback renders today's worker.json.
-		`} } + $isolation) } ],`,
+		"\n    } + $isolation) } ],",
 		`--argjson isolation "$isolation"`,
 		// Rollback starts NativeLink as before (only its log filter is set:
 		// the boot-to-first-action line reads local_worker's receipt lines).
@@ -128,6 +128,10 @@ func TestRBEWorkerScriptIsolationConfig(t *testing.T) {
 		"RBE_X_TIMEOUT_MS":   "timeout_millis",
 		"RBE_X_SIDE_CHANNEL": "side_channel_file",
 		"RBE_X_NETWORK":      map[string]any{"property": "network"},
+		// worker-env and worker-env-base: the launcher hides the host's go
+		// and dolt from an action keyed on the base alone (TestRBEActionHostTools).
+		"RBE_X_WORKER_ENV":      map[string]any{"property": "worker-env"},
+		"RBE_X_WORKER_ENV_BASE": map[string]any{"property": "worker-env-base"},
 	}; !reflect.DeepEqual(got, want) {
 		t.Errorf("additional_environment = %v, want %v", got, want)
 	}
@@ -740,13 +744,14 @@ func TestRBEActionPerActionNetwork(t *testing.T) {
 		`[[ $NETNS == [01] ]] || die "NETNS must be 0 or 1"`,
 		// A control value: validated, stripped from the action's environment,
 		// never given twice.
-		"\t\tRBE_X_NETWORK=*)\n\t\t\t((!net_set)) || die \"RBE_X_NETWORK given twice\"\n\t\t\tnet=${e#*=} net_set=1\n\t\t\t;;\n\t\t*) envs+=(\"$e\") ;;\n",
+		"\t\tRBE_X_NETWORK=*)\n\t\t\t((!net_set)) || die \"RBE_X_NETWORK given twice\"\n\t\t\tnet=${e#*=} net_set=1\n\t\t\t;;\n",
+		"\t\t*) envs+=(\"$e\") ;;\n",
 		`netns=$(action_netns "$net") || die "bad RBE_X_NETWORK (off, on or empty)"`,
 		"\tif [[ $netns == 1 ]]; then\n\t\tns+=(--net)\n\t\thost_net=$(readlink /proc/self/ns/net)\n\tfi\n",
-		`"$SELF" --ns "$op" "$slot" "$rel" "$secs" "$sc" "$lk" "$host_net" "${#envs[@]}" "${envs[@]}" "${argv[@]}"`,
+		`"$SELF" --ns "$op" "$slot" "$rel" "$secs" "$sc" "$lk" "$host_net" "$tools" "${#envs[@]}" "${envs[@]}" "${argv[@]}"`,
 		// pid 1: never the host's network when loopback only was chosen, and
 		// never the host's network with NETNS=1.
-		"\tlocal op=$1 slot=$2 rel=$3 secs=$4 sc=$5 lk=$6 host_net=$7\n\tshift 7\n",
+		"\tlocal op=$1 slot=$2 rel=$3 secs=$4 sc=$5 lk=$6 host_net=$7 host_tools=$8\n\tshift 8\n",
 		`[[ $NETNS != 1 ]] || { echo "rbe-action: NETNS=1 but no network namespace" >&2; false; }`,
 		`[[ $host_net =~ ^net:\[[0-9]+\]$ && $(readlink /proc/self/ns/net) != "$host_net" ]] ||`,
 		// The egress filter stays required by the worker's own NETNS.
@@ -768,7 +773,7 @@ func TestRBEActionPerActionNetwork(t *testing.T) {
 	for _, want := range []string{
 		// The main probe runs as an action without the property does.
 		`RBE_X_TIMEOUT_MS=300000 RBE_X_NETWORK= "$LIB/entry" /bin/bash -c "$probe"`,
-		`'{"RBE_X_TIMEOUT_MS":"timeout_millis","RBE_X_SIDE_CHANNEL":"side_channel_file","RBE_X_NETWORK":{"property":"network"}}'`,
+		`'{"RBE_X_TIMEOUT_MS":"timeout_millis","RBE_X_SIDE_CHANNEL":"side_channel_file","RBE_X_NETWORK":{"property":"network"},"RBE_X_WORKER_ENV":{"property":"worker-env"},"RBE_X_WORKER_ENV_BASE":{"property":"worker-env-base"}}'`,
 		`loopback_only=$'I lo\nD 127.0.0.1:9 refused\nD 192.0.2.1:9 unreachable\nexit 0'`,
 		`check "off: loopback only" test "$out" = "$loopback_only"`,
 		`check "on, NETNS=1: still loopback only" test "$out" = "$loopback_only"`,
