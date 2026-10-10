@@ -167,8 +167,17 @@ WORKER_TOOLSET=(make jq sqlite3 tmux lsof cmake git libstdc++6 libgcc-s1 zlib1g
 	libxml2 liblzma5 xz-utils libicu74 zlib1g-dev libsqlite3-dev libbz2-dev
 	liblzma-dev libffi-dev libexpat1-dev libxml2-dev libreadline-dev
 	libncurses-dev python3-dev)
-sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y -qq \
-	"${WORKER_TOOLSET[@]}" >/dev/null
+# The image's apt index can lag the mirror: a superseded .deb then 404s
+# (2026-10-10: libxml2 2.9.14+dfsg-1.3ubuntu3.9). Refresh the index once and
+# retry; worker-env measures upstream major.minor, which a refresh within
+# the release does not move.
+apt_install() {
+	sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y -qq "$@" >/dev/null && return 0
+	echo "rbe-worker: package install failed; refreshing the package index and retrying" >&2
+	sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+	sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y -qq "$@" >/dev/null
+}
+apt_install "${WORKER_TOOLSET[@]}"
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
 	sum=$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" |
 		jq -r --arg f "go${GO_VERSION}.linux-amd64.tar.gz" '.[].files[] | select(.filename==$f) | .sha256')

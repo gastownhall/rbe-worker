@@ -599,7 +599,10 @@ func TestRBEWorkerScriptAdvertisesWorkerEnv(t *testing.T) {
 	at := 0
 	for _, want := range []string{
 		"\nWORKER_TOOLSET=(",
-		"apt-get install -y -qq \\\n\t\"${WORKER_TOOLSET[@]}\" >/dev/null\n",
+		"apt-get install -y -qq \"$@\" >/dev/null && return 0\n",
+		"apt-get update -qq >/dev/null\n",
+		"apt-get install -y -qq \"$@\" >/dev/null\n",
+		"\napt_install \"${WORKER_TOOLSET[@]}\"\n",
 		"\tsudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf \"$RUNNER_TEMP/go.tgz\"\n",
 		"\tsudo cp -f \"$RUNNER_TEMP/dolt-linux-amd64/bin/dolt\" /usr/local/bin/dolt\n",
 		"\n\"$HERE/worker-env\" >\"$RUNNER_TEMP/worker-env.txt\"\n",
@@ -618,8 +621,10 @@ func TestRBEWorkerScriptAdvertisesWorkerEnv(t *testing.T) {
 	if n := strings.Count(script, "WORKER_ENV="); n != 1 {
 		t.Errorf("%s assigns WORKER_ENV %d times; the measurement is its only source", rbeWorkerScript, n)
 	}
-	if n := strings.Count(script, "apt-get install"); n != 2 {
-		t.Errorf("%s has %d apt-get installs, want the toolset's and the isolation phase's", rbeWorkerScript, n)
+	// apt_install's two installs (the retry after an index refresh, both
+	// before the measurement) and the isolation phase's.
+	if n := strings.Count(script, "apt-get install"); n != 3 {
+		t.Errorf("%s has %d apt-get installs, want apt_install's two and the isolation phase's", rbeWorkerScript, n)
 	}
 	// The image's apt lists carry newer candidates than some installed
 	// packages (installing libc6-dev upgrades libc6), so an install after
