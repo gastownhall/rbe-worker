@@ -45,8 +45,13 @@ for f in entry exec; do
 	check "$LIB/$f: root-owned, 0755, statically linked" \
 		bash -c "[[ \$(stat -c '%U %a' $LIB/$f) == 'root 755' ]] && file -b $LIB/$f | grep -q 'statically linked'"
 done
-for f in launch sweep selftest undeclared-host-tool; do check "$LIB/$f: root 0755" test "$(stat -c '%U %a' "$LIB/$f")" = "root 755"; done
+for f in launch sweep selftest undeclared-host-tool host-tools; do check "$LIB/$f: root 0755" test "$(stat -c '%U %a' "$LIB/$f")" = "root 755"; done
 check "$CONF: root 0644" test "$(stat -c '%U %a' "$CONF")" = "root 644"
+# The host-tools mask plan, where isolate() wrote one: root's, and today's.
+if [[ -e /etc/rbe-west/rbe-action-host-tools ]]; then
+	check "/etc/rbe-west/rbe-action-host-tools: root 0644, equal to $LIB/host-tools now" \
+		bash -c "[[ \$(stat -c '%U %a' /etc/rbe-west/rbe-action-host-tools) == 'root 644' ]] && diff -q /etc/rbe-west/rbe-action-host-tools <('$LIB/host-tools')"
+fi
 check "/etc/sudoers.d/rbe-action: root 0440, parses" bash -c '[[ $(stat -c "%U %a" /etc/sudoers.d/rbe-action) == "root 440" ]] && visudo -cq'
 slots_ok() {
 	local i u
@@ -417,14 +422,16 @@ done'
 
 	echo "# host tools: an action that sends only worker-env-base reaches no host go or dolt (exit 127); one that sends worker-env (or neither) keeps them; anything else is refused"
 	# Every go, gofmt and dolt the action's PATH and the Go roots offer, as
-	# "T <path> <exit status>", then its RBE_HOST_TOOLS and whether a Go root's
-	# pkg is empty. The PATH holds the image's (Bazel's test PATH
-	# /bin:/usr/bin:/usr/local/bin reaches Go through /usr/bin/go, the
-	# toolcache's) and the CI test PATH's /usr/local/go/bin.
+	# "T <path> <exit status>" of "<path> version" (stdin empty), then its
+	# RBE_HOST_TOOLS and whether a Go root's pkg is empty. The PATH holds the
+	# image's (Bazel's test PATH /bin:/usr/bin:/usr/local/bin reaches Go through
+	# /usr/bin/go, the toolcache's) and the CI test PATH's /usr/local/go/bin. A
+	# tool runs when it exits anything but 127 (the stub's, and "not found"):
+	# gofmt exits 2 on "version", a real run all the same.
 	tools_probe='for t in go gofmt dolt; do
 	for p in $(type -ap "$t") /usr/local/go/bin/"$t" /opt/hostedtoolcache/go/*/*/bin/"$t"; do
 		[ -e "$p" ] || continue
-		"$p" version >/dev/null 2>&1
+		"$p" version </dev/null >/dev/null 2>&1
 		echo "T $p $?"
 	done
 done | sort -u
@@ -445,7 +452,7 @@ echo "E ${RBE_HOST_TOOLS:-}"
 	# the host's tools, and exit 127 in a base-only one, where also nothing
 	# the host lacks may appear.
 	host_ok=$(setpriv --reuid="$WORKER_UID" --regid="$WORKER_GID" --init-groups -- env -i "$tools_path" bash -c "$tools_probe" 2>/dev/null |
-		awk '$1 == "T" && $3 == 0 { print $2 }' | sort)
+		awk '$1 == "T" && $3 != 127 { print $2 }' | sort)
 	sha_a=sha256:$(printf '%064d' 0) sha_b=sha256:$(printf '%064d' 1)
 	out=$(tools_action "RBE_X_WORKER_ENV_BASE=$sha_b")
 	masked_bad=$(awk '$1 == "T" && $3 != 127 { print $2 }' <<<"$out")
@@ -461,7 +468,7 @@ echo "E ${RBE_HOST_TOOLS:-}"
 		*) out=$(tools_action) ;;
 		esac
 		check "$what: the host's go, gofmt and dolt run as on the host" \
-			test "$(awk '$1 == "T" && $3 == 0 { print $2 }' <<<"$out" | sort):$(grep '^E ' <<<"$out")" = "$host_ok:E "
+			test "$(awk '$1 == "T" && $3 != 127 { print $2 }' <<<"$out" | sort):$(grep '^E ' <<<"$out")" = "$host_ok:E "
 	done
 	out=$(tools_action "RBE_X_WORKER_ENV_BASE=sha256:nothex")
 	check "a malformed RBE_X_WORKER_ENV_BASE: refused, never run (exit 125)" \

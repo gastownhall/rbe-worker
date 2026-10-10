@@ -30,7 +30,9 @@
 # The action controls its environment, argv and working directory: they are
 # data here. Nothing from them is evaluated, used as a path for a privileged
 # operation, or trusted as configuration. Exit 125: the launcher failed.
-set -euo pipefail
+# -E: the ERR trap of pid 1 (inner) also fires inside its functions
+# (mask_host_tools), so any failure there fixes up and exits 125.
+set -Eeuo pipefail
 umask 022
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 CONF=/etc/rbe-west/rbe-action.env
@@ -38,6 +40,8 @@ SELF=/usr/local/libexec/rbe-action/launch
 EXEC=/usr/local/libexec/rbe-action/exec
 RUN=/run/rbe-action
 HOST_TOOL_STUB=/usr/local/libexec/rbe-action/undeclared-host-tool
+HOST_TOOLS_GEN=/usr/local/libexec/rbe-action/host-tools
+HOST_TOOLS_PLAN=/etc/rbe-west/rbe-action-host-tools
 
 die() { echo "rbe-action: $*" >&2; exit 125; }
 
@@ -107,32 +111,32 @@ action_host_tools() {
 }
 
 # mask_host_tools: in pid 1's mount namespace, HOST_TOOL_STUB (exit 127,
-# saying why) bound over every go, gofmt and dolt an action can reach: in the
-# directories of an action's PATH, each resolved once (a symlink's target is
-# masked: Bazel's test PATH /bin:/usr/bin:/usr/local/bin reaches Go through
-# the image's /usr/bin/go -> /opt/hostedtoolcache/go/<v>/x64/bin/go, a Go that
-# worker-env does not even measure), and in each Go root's bin (/usr/local/go,
-# every toolcache Go). Each root's pkg (the compiler and linker binaries) gets
-# an empty read-only tmpfs. Stubs rather than hiding: a test that looks the
-# tool up still finds it and fails loudly, instead of skipping quietly.
+# saying why) over every host go, gofmt and dolt an action can reach, and an
+# empty read-only tmpfs over each Go root's pkg: the plan rbe-action-host-tools
+# prints (its header says what and why). isolate() writes the plan once to
+# HOST_TOOLS_PLAN; without one (another installer) it is computed here. Stubs
+# rather than hiding: a test that looks the tool up still finds it and fails
+# loudly, instead of skipping quietly. A stale plan entry fails the mount, and
+# with it the action (exit 125): never an unmasked run.
 mask_host_tools() {
-	local d t f root
-	local -A seen=()
-	local -a roots=()
-	for root in /usr/local/go /opt/hostedtoolcache/go/*/*; do
-		if [[ -d $root/bin ]]; then roots+=("$root"); fi
-	done
-	for d in /usr/local/bin /usr/bin /bin /usr/local/sbin /usr/sbin /sbin "${roots[@]/%//bin}"; do
-		for t in go gofmt dolt; do
-			f=$(realpath -e -- "$d/$t" 2>/dev/null) || continue
-			[[ -z ${seen[$f]:-} ]] || continue
-			seen[$f]=1
-			mount --bind "$HOST_TOOL_STUB" "$f"
-		done
-	done
-	for root in "${roots[@]}"; do
-		if [[ -d $root/pkg ]]; then mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$root/pkg"; fi
-	done
+	local plan kind p
+	if [[ -f $HOST_TOOLS_PLAN && ! -L $HOST_TOOLS_PLAN && $(stat -c '%u %a' "$HOST_TOOLS_PLAN") =~ ^0\ [0-7][0145][0145]$ ]]; then
+		plan=$(<"$HOST_TOOLS_PLAN")
+	else
+		plan=$("$HOST_TOOLS_GEN")
+	fi
+	while read -r kind p; do
+		[[ -n $kind ]] || continue
+		[[ $p == /* && $p != *..* ]] || { echo "rbe-action: bad host-tools plan line: $kind $p" >&2; false; }
+		case $kind in
+		bind) mount --bind "$HOST_TOOL_STUB" "$p" ;;
+		tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" ;;
+		*)
+			echo "rbe-action: bad host-tools plan line: $kind $p" >&2
+			false
+			;;
+		esac
+	done <<<"$plan"
 }
 
 outer() {

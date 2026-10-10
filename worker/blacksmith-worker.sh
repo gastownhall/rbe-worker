@@ -409,6 +409,7 @@ isolate() {
 	sudo install -m 0755 "$HERE/rbe-action-sweep" "$LIB/sweep"
 	sudo install -m 0755 "$HERE/rbe-action-selftest" "$LIB/selftest"
 	sudo install -m 0755 "$HERE/undeclared-host-tool" "$LIB/undeclared-host-tool"
+	sudo install -m 0755 "$HERE/rbe-action-host-tools" "$LIB/host-tools"
 	# No directory but the action's own (its outputs, /tmp, /var/tmp, HOME,
 	# /dev/shm, TMPFS_DIRS: private per action) may be writable by every
 	# action, or one could leave files for a later one. The image's
@@ -441,6 +442,11 @@ isolate() {
 		PROBE_DENY="169.254.169.254:80"
 		WORKER_JSON=$ROOT/worker.json
 	EOF
+	# The host-tools mask plan, once (rbe-action-launch mask_host_tools): every
+	# host go, gofmt and dolt, resolved after this script installed them.
+	phase host-tools
+	sudo "$LIB/host-tools" | sudo tee /etc/rbe-west/rbe-action-host-tools >/dev/null
+	sudo chmod 0644 /etc/rbe-west/rbe-action-host-tools
 	phase sudoers
 	printf 'Defaults!%s/launch !pam_session, !log_allowed, !use_pty, !lecture\n' "$LIB" |
 		sudo tee /etc/sudoers.d/rbe-action >/dev/null

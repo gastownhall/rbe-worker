@@ -178,16 +178,15 @@ func TestRBEActionHostTools(t *testing.T) {
 		"\t\tRBE_X_WORKER_ENV_BASE=*)\n\t\t\t((!wbase_set)) || die \"RBE_X_WORKER_ENV_BASE given twice\"\n",
 		"\ttools=$(action_host_tools \"$wenv\" \"$wbase\") ||\n",
 		`if [[ $tools == masked ]]; then envs+=("RBE_HOST_TOOLS=masked"); fi`,
-		// pid 1 masks before ROOT_RO's remount walk, and refuses anything else.
+		// pid 1 masks before ROOT_RO's remount walk, and refuses anything else;
+		// -E: a failed mount there hits the ERR trap (fixup, exit 125).
 		"\tmasked) mask_host_tools ;;\n\thost) ;;\n",
-		// Every reachable go, gofmt and dolt (PATH directories and Go roots,
-		// symlinks resolved: the image's /usr/bin/go is the toolcache's), and
-		// each Go root's pkg.
-		`for root in /usr/local/go /opt/hostedtoolcache/go/*/*; do`,
-		`for d in /usr/local/bin /usr/bin /bin /usr/local/sbin /usr/sbin /sbin "${roots[@]/%//bin}"; do`,
-		"\t\tfor t in go gofmt dolt; do\n\t\t\tf=$(realpath -e -- \"$d/$t\" 2>/dev/null) || continue\n",
-		`mount --bind "$HOST_TOOL_STUB" "$f"`,
-		`mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$root/pkg"`,
+		"set -Eeuo pipefail\n",
+		// The plan isolate() wrote (root's, not group/world-writable), or the
+		// generator's output, mounted line by line.
+		"HOST_TOOLS_PLAN=/etc/rbe-west/rbe-action-host-tools\n",
+		`bind) mount --bind "$HOST_TOOL_STUB" "$p" ;;`,
+		`tmpfs) mount -t tmpfs -o ro,size=4k,mode=0555,nosuid,nodev rbe-nohost "$p" ;;`,
 	} {
 		if !strings.Contains(launch, want) {
 			t.Errorf("rbe-action-launch missing %q", want)
@@ -197,17 +196,43 @@ func TestRBEActionHostTools(t *testing.T) {
 		t.Errorf("rbe-action-launch: mask_host_tools must run before the ROOT_RO walk (mask %d, walk %d)", mask, walk)
 	}
 
+	// The plan: every reachable go, gofmt and dolt (PATH directories and Go
+	// roots, symlinks resolved: the image's /usr/bin/go is the toolcache's),
+	// and each Go root's pkg.
+	gen := readFile(t, root, "worker/rbe-action-host-tools")
+	for _, want := range []string{
+		`for root in /usr/local/go /opt/hostedtoolcache/go/*/*; do`,
+		`for d in /usr/local/bin /usr/bin /bin /usr/local/sbin /usr/sbin /sbin "${roots[@]/%//bin}"; do`,
+		"\tfor t in go gofmt dolt; do\n\t\tf=$(realpath -e -- \"$d/$t\" 2>/dev/null) || continue\n",
+		`emit bind "$f"`,
+		`if [[ -d $root/pkg ]]; then emit tmpfs "$root/pkg"; fi`,
+	} {
+		if !strings.Contains(gen, want) {
+			t.Errorf("worker/rbe-action-host-tools missing %q", want)
+		}
+	}
+
 	stub := readFile(t, root, "worker/undeclared-host-tool")
 	if !strings.HasPrefix(stub, "#!/bin/sh\n") || !strings.HasSuffix(stub, "\nexit 127\n") || !strings.Contains(stub, "worker-env-base") {
 		t.Errorf("worker/undeclared-host-tool must be a sh script that says why and exits 127:\n%s", stub)
 	}
 	script = readFile(t, root, rbeWorkerScript)
-	if !strings.Contains(script, `sudo install -m 0755 "$HERE/undeclared-host-tool" "$LIB/undeclared-host-tool"`) {
-		t.Errorf("%s does not install worker/undeclared-host-tool", rbeWorkerScript)
+	for _, want := range []string{
+		`sudo install -m 0755 "$HERE/undeclared-host-tool" "$LIB/undeclared-host-tool"`,
+		`sudo install -m 0755 "$HERE/rbe-action-host-tools" "$LIB/host-tools"`,
+		`sudo "$LIB/host-tools" | sudo tee /etc/rbe-west/rbe-action-host-tools >/dev/null`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("%s missing %q", rbeWorkerScript, want)
+		}
 	}
 	selftest := readFile(t, root, "worker/rbe-action-selftest")
 	for _, want := range []string{
-		"for f in launch sweep selftest undeclared-host-tool; do",
+		"for f in launch sweep selftest undeclared-host-tool host-tools; do",
+		// A tool runs when it exits anything but 127: gofmt exits 2 on
+		// "version", which once failed every worker's selftest.
+		`"$p" version </dev/null >/dev/null 2>&1`,
+		`awk '$1 == "T" && $3 != 127 { print $2 }'`,
 		`check "base only: every host go, gofmt and dolt exits 127`,
 		`check "base only: RBE_HOST_TOOLS=masked, the Go root's pkg empty, exit 0"`,
 		`check "$what: the host's go, gofmt and dolt run as on the host"`,

@@ -25,7 +25,7 @@ jobs:
           shellcheck -S warning \
             worker/blacksmith-worker.sh worker/rbe-action-launch \
             worker/rbe-action-selftest worker/rbe-action-sweep \
-            worker/worker-env worker/worker-env-drift worker/undeclared-host-tool \
+            worker/worker-env worker/worker-env-drift worker/undeclared-host-tool worker/rbe-action-host-tools \
             client/setup-bazel/*.sh bin/bump-summary
       - name: gcc -Werror (both rbe-action-entry.c builds)
         run: |

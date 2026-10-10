@@ -1,0 +1,40 @@
+#!/bin/bash
+# rbe-action-host-tools: print the mask plan for actions keyed on worker-env-base
+# alone (rbe-action-launch mask_host_tools; rbe-reexecution-design.md (c)). Root,
+# installed at /usr/local/libexec/rbe-action/host-tools; blacksmith-worker.sh's
+# isolate() writes its output once to /etc/rbe-west/rbe-action-host-tools, so a
+# masked action mounts a list instead of walking the host for it.
+#
+# One line per mount:
+#   bind <file>   undeclared-host-tool goes over it: every go, gofmt and dolt in
+#                 the directories of an action's PATH, symlinks resolved (Bazel's
+#                 test PATH reaches Go through the image's /usr/bin/go, the
+#                 toolcache's), and in each Go root's bin (/usr/local/go, every
+#                 /opt/hostedtoolcache/go/<v>/<arch>);
+#   tmpfs <dir>   an empty read-only tmpfs over each Go root's pkg (the compiler
+#                 and linker binaries).
+# A Go root's src and lib stay readable: only programs are masked, and source
+# files run nothing on their own.
+# Exit 1 on a path the plan cannot carry (whitespace or a newline in it).
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+roots=()
+for root in /usr/local/go /opt/hostedtoolcache/go/*/*; do
+	if [[ -d $root/bin ]]; then roots+=("$root"); fi
+done
+declare -A seen=()
+emit() {
+	[[ $2 == /* && $2 != *[[:space:]]* ]] || { echo "rbe-action-host-tools: cannot carry path ${2@Q}" >&2; exit 1; }
+	echo "$1 $2"
+}
+for d in /usr/local/bin /usr/bin /bin /usr/local/sbin /usr/sbin /sbin "${roots[@]/%//bin}"; do
+	for t in go gofmt dolt; do
+		f=$(realpath -e -- "$d/$t" 2>/dev/null) || continue
+		[[ -z ${seen[$f]:-} ]] || continue
+		seen[$f]=1
+		emit bind "$f"
+	done
+done
+for root in "${roots[@]}"; do
+	if [[ -d $root/pkg ]]; then emit tmpfs "$root/pkg"; fi
+done

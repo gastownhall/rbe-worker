@@ -47,7 +47,7 @@ func TestRBEWorkerScriptPathsResolveInTree(t *testing.T) {
 			t.Fatalf("%s: prelude %q missing %q", rbeWorkerScript, prelude, want)
 		}
 	}
-	siblings := []string{"worker-env", "worker-env-drift", "rbe-action-entry.c", "rbe-action-launch", "rbe-action-selftest", "rbe-action-sweep", "undeclared-host-tool"}
+	siblings := []string{"worker-env", "worker-env-drift", "rbe-action-entry.c", "rbe-action-launch", "rbe-action-selftest", "rbe-action-sweep", "undeclared-host-tool", "rbe-action-host-tools"}
 	script2 := prelude + "echo \"HERE=$HERE\"\necho \"RBE_PRODUCT_ROOT=$RBE_PRODUCT_ROOT\"\n"
 	for _, s := range siblings {
 		script2 += fmt.Sprintf(`echo "HERE/%s=$HERE/%s"`+"\n", s, s)
