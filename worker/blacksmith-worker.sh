@@ -39,11 +39,7 @@
 #                             the pin (tools/rbe/worker-env-drift check) and exit;
 #                             no certificate, no worker (the canary, and the
 #                             bazel job for changes to the worker host)
-#   CACHE_DIR           optional (Blacksmith sticky disk): keeps the worker's local
-#                       CAS warm across runs. Another VM wrote it, so every blob is
-#                       re-hashed against its name before NativeLink loads it
-#                       (scrub_cas), and the CAS is capped at CAS_MAX_BYTES.
-#   CAS_MAX_BYTES       local CAS cap (default 150 GB; 60 GB on a sticky disk)
+#   CAS_MAX_BYTES       local CAS cap (default 150 GB)
 #   RBE_WIRE_ZSTD       1: fetches of blobs of 64 KiB or more travel as REAPI
 #                       compressed-blobs/zstd (NativeLink 1.7.1 GrpcStore
 #                       experimental_remote_cache_compression), for both tiers;
@@ -217,67 +213,17 @@ curl -fsSL -o "$RUNNER_TEMP/nl.tgz" "https://github.com/TraceMachina/nativelink/
 echo "${NL_SHA256}  $RUNNER_TEMP/nl.tgz" | sha256sum -c -
 mkdir -p "$NL_BIN_DIR" && tar -C "$NL_BIN_DIR" -xzf "$RUNNER_TEMP/nl.tgz" nativelink
 
-# Local CAS (and its temp dir, which must share the filesystem for renames)
-# lives on the sticky disk when one is mounted. content.exec sits next to
-# content and is wiped by NativeLink at startup.
-STORE=${CACHE_DIR:-$ROOT}
+# Local CAS (and its temp dir, which must share the filesystem for renames).
+# content.exec sits next to content and is wiped by NativeLink at startup. A
+# warm start comes only from the read-only warm set (RBE_WARM_URL, warm-cas),
+# never from a Blacksmith sticky disk: any job in the product repository could
+# commit one, and NativeLink never re-hashes what it loads.
+STORE=$ROOT
 # work/ must share the CAS's filesystem: NativeLink 1.7.1 hardlinks every input
-# from the CAS into the action directory (fs::hard_link_many, no copy
-# fallback), so a CAS on a sticky disk with work/ on the root filesystem fails
-# every action with EXDEV. On a sticky disk work/ is scratch: emptied before
-# NativeLink starts and before the disk is committed.
+# from the CAS into the action directory (fs::hard_link_many, no copy fallback).
 WORK=$STORE/work
-CAS_MAX_BYTES=${CAS_MAX_BYTES:-$([ -n "${CACHE_DIR:-}" ] && echo 60000000000 || echo 150000000000)}
+CAS_MAX_BYTES=${CAS_MAX_BYTES:-150000000000}
 [[ $CAS_MAX_BYTES =~ ^[1-9][0-9]{9,12}$ ]] || { echo "CAS_MAX_BYTES must be bytes (1e9..1e13)" >&2; exit 2; }
-
-# A sticky-disk CAS is untrusted input: any VM that mounted the same key wrote
-# it. NativeLink 1.7.1's filesystem store names each blob
-# d2/<sha256>-<size>-<generation> and never re-hashes it on read, so before
-# NativeLink loads the directory every file must be a regular file whose
-# SHA-256 and size match its name, owned by this user and not writable by
-# anyone else (a slot user must never get a writable inode of an input).
-# Everything else is deleted: a poisoned or garbage disk costs a cold cache,
-# never a wrong input.
-scrub_cas() { # STORE
-	local c=$1/content bad kept
-	sudo rm -rf --one-file-system "$1/tmp" "$1/work" "$c.exec"
-	mkdir -p "$1/tmp" "$1/work" "$c/d2"
-	find "$c" -mindepth 1 -maxdepth 1 ! -name d2 -exec rm -rf --one-file-system {} +
-	find "$c/d2" -mindepth 1 \( ! -type f -o -links +1 \) -exec rm -rf --one-file-system {} + 2>/dev/null || true
-	sudo chown -R --no-dereference "$(id -u):$(id -g)" "$1"
-	find "$1" -perm /022 -exec chmod go-w {} +
-	# -regextype is positional and must come before -regex: after the ! it
-	# negated an always-true option and the filter deleted nothing. -delete
-	# takes any name, so once it ran every name left is [0-9a-f-] only.
-	find "$c/d2" -regextype posix-extended -type f ! -regex '.*/[0-9a-f]{64}-[0-9]{1,15}-[0-9]{1,20}' -delete
-	# Size and SHA-256 against the name, run inside d2 so that neither
-	# CACHE_DIR's own path nor sha256sum's escaping reaches awk.
-	bad=$RUNNER_TEMP/cas-scrub.bad
-	(
-		cd "$c/d2"
-		find . -type f -printf '%s %f\n' | awk '{ split($2, a, "-"); if (a[2] != $1) print $2 }'
-		find . -type f -print0 | xargs -0 -r -n 256 -P "$(nproc)" sha256sum |
-			awk '{ n = $2; sub(".*/", "", n); if (substr(n, 1, 64) != $1) print n }'
-	) | sort -u >"$bad"
-	(cd "$c/d2" && tr '\n' '\0' <"$bad" | xargs -0 -r rm -f --)
-	kept=$(find "$c/d2" -type f | wc -l)
-	echo "cas scrub: $(wc -l <"$bad") blobs removed, $kept kept ($(du -sh "$c/d2" | cut -f1))"
-}
-if [ -n "${CACHE_DIR:-}" ]; then
-	# A subshell outside any condition, so set -e holds inside it (it would
-	# not in one), and a failed scrub costs the cache, never the worker.
-	set +e
-	(
-		set -e
-		scrub_cas "$STORE"
-	)
-	scrub_rc=$?
-	set -e
-	if [ "$scrub_rc" != 0 ]; then
-		echo "::warning title=rbe cas scrub::scrub failed (exit $scrub_rc); this worker starts with an empty CAS"
-		sudo rm -rf --one-file-system "$STORE/content" "$STORE/content.exec" "$STORE/tmp" "$STORE/work"
-	fi
-fi
 mkdir -p "$ROOT/pki" "$WORK" "$STORE"/{content,tmp}
 umask 077
 printf '%s' "$RBE_WORKER_TLS_CERT" | base64 -d >"$ROOT/pki/worker.pem"
@@ -416,8 +362,8 @@ isolate() {
 	# Canonical paths: the launcher compares them with the action's pwd -P.
 	MASK_ROOT=$(cd "$HOME" && pwd -P)
 	WORK_ROOT=$(cd "${WORK:-$ROOT/work}" && pwd -P)
-	# The CAS must stay under the mask: a CACHE_DIR (sticky disk) outside $HOME
-	# would be visible to actions, so isolation refuses it.
+	# The CAS must stay under the mask: outside $HOME it would be visible to
+	# actions, so isolation refuses it.
 	for d in "$WORK_ROOT" "$(cd "$ROOT" && pwd -P)" "$(cd "$STORE" && pwd -P)"; do
 		case "$d" in "$MASK_ROOT"/*) ;; *) fail "$d must be under $MASK_ROOT (MASK_ROOT, hidden from actions)" ;; esac
 	done
@@ -700,8 +646,6 @@ if kill -0 "$nl" 2>/dev/null; then
 	timeout 300 tail --pid="$nl" -f /dev/null || kill -KILL "$nl"
 fi
 grep -E 'registered|GoingAway|ERROR' "$ROOT/worker.log" | tail -20 || true
-# A sticky disk is committed after this step: leave no action scratch on it.
-[ -z "${CACHE_DIR:-}" ] || sudo find "$WORK" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system {} + 2>/dev/null || true
 # P5: what this VM cost rbe-west (bytes received on the default route since boot,
 # the local CAS size) and how many compressed reads fell back or failed.
 dev=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1); exit }')

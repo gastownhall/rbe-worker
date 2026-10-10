@@ -3,8 +3,6 @@ package scripts_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -975,100 +973,6 @@ func TestRBEWorkerIsolationCanary(t *testing.T) {
 				t.Errorf("unusable-setting warning = %v, want %v\n%s", got, c.warn, r.out)
 			}
 		})
-	}
-}
-
-// A sticky disk is written by other VMs, so scrub_cas must delete whatever it
-// holds that is not a blob named for its own SHA-256 and size, whatever the
-// name: quotes and spaces once aborted it under set -e (xargs read them as
-// quoting), and -regextype after ! left GNU find 4.9's name filter dead. The
-// function runs from the script itself in bash, with sudo as a pass-through
-// (chown to the caller's own ids needs no root), on a store whose own path
-// has a space and a quote too.
-func TestRBEWorkerScrubCAS(t *testing.T) {
-	m := regexp.MustCompile(`(?s)\nscrub_cas\(\) \{ # STORE\n.*?\n\}\n`).FindString(readFile(t, repoRoot(t), rbeWorkerScript))
-	if m == "" {
-		t.Fatalf("%s: no scrub_cas function", rbeWorkerScript)
-	}
-	tmp := t.TempDir()
-	store := filepath.Join(tmp, "sticky disk's")
-	d2 := filepath.Join(store, "content", "d2")
-	for _, d := range []string{d2, filepath.Join(store, "work", "action 1"), filepath.Join(store, "tmp"), filepath.Join(tmp, "runner")} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	blob := func(body string) string {
-		sum := sha256.Sum256([]byte(body))
-		return hex.EncodeToString(sum[:]) + "-" + strconv.Itoa(len(body)) + "-7"
-	}
-	good, open := blob("kept"), blob("kept, world-writable")
-	files := map[string]string{
-		good:                 "kept",
-		open:                 "kept, world-writable",
-		blob("hashed") + "x": "hashed", // not the name pattern
-		blob("other"):        "OTHER",  // hash mismatch, same size
-		strings.Replace(blob("short"), "-5-", "-50-", 1): "short", // wrong size in the name
-		"it's a blob":             "single quote",  // aborted xargs
-		`say "cheese" now`:        "double quotes", // aborted xargs
-		"new\nline " + blob("nl"): "nl",            // newline: a split name
-		"back\\slash":             "sha256sum escape",
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(d2, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Chmod(filepath.Join(d2, open), 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/etc/passwd", filepath.Join(d2, blob("link"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(store, "content", "stray"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// GNU find and coreutils, as on the runner image; exit 77 skips elsewhere.
-	prog := "set -euo pipefail\n" +
-		"{ find --version | grep -q GNU && command -v sha256sum nproc; } >/dev/null 2>&1 || exit 77\n" +
-		"sudo() { \"$@\"; }\n" + m + "scrub_cas \"$1\"\n"
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", prog, "bash", store)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C", "RUNNER_TEMP=" + filepath.Join(tmp, "runner")}
-	out, err := cmd.CombinedOutput()
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 77 {
-		t.Skip("scrub_cas needs GNU find and coreutils (the runner image's)")
-	}
-	if err != nil {
-		t.Fatalf("scrub_cas: %v\n%s", err, out)
-	}
-	entries, err := os.ReadDir(d2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var kept []string
-	for _, e := range entries {
-		kept = append(kept, e.Name())
-	}
-	want := []string{good, open}
-	if good > open {
-		want = []string{open, good}
-	}
-	if !reflect.DeepEqual(kept, want) {
-		t.Errorf("d2 kept %q, want %q\n%s", kept, want, out)
-	}
-	if fi, err := os.Stat(filepath.Join(d2, open)); err != nil || fi.Mode().Perm()&0o022 != 0 {
-		t.Errorf("%s: want go-w, got %v %v", open, fi, err)
-	}
-	for _, gone := range []string{filepath.Join(store, "content", "stray"), filepath.Join(store, "work", "action 1")} {
-		if _, err := os.Lstat(gone); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("%s survived the scrub (%v)", gone, err)
-		}
-	}
-	if !strings.Contains(string(out), "cas scrub: 2 blobs removed, 2 kept") {
-		t.Errorf("scrub summary: want 2 blobs removed (hash, size), 2 kept; got\n%s", out)
 	}
 }
 
