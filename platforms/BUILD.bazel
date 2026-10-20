@@ -8,6 +8,6 @@
 platform(
     name = "rbe_worker",
     exec_properties = {
-        "worker-env": "sha256:46fb1bc45f1f64c96fd15b3d595d954dc496f22ed5ea1a34de8ccc90b35fa1c9",
+        "worker-env": "sha256:c1516bfec83e187a66109fc925e293be0c2ba4c65e527e3c6dbab4f2b7e5a9b8",
     },
 )
