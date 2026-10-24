@@ -437,7 +437,7 @@ while [ ! -e "$NL_CAPTURE" ] && [ $i -lt 200 ]; do
 done
 `,
 	"uname":      "echo x86_64\n",
-	"dolt":       "echo 'dolt version 2.1.8'\n",
+	"dolt":       "echo 'dolt version 2.6.0'\n",
 	"go":         "echo 'go version go0.0.0-drifted linux/amd64'\n",
 	"dpkg-query": "for p; do :; done\nprintf 'installed 9.9-drifted-%s\\n' \"$p\"\n",
 }
