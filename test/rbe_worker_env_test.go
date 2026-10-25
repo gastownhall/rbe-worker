@@ -397,7 +397,7 @@ END { if (!found) { print "dpkg-query: no packages found matching " p > "/dev/st
 // on before 2026-10-07, as dpkg reported it (the measured packages; curl,
 // dash, openssl, python3 and unzip at the image's noble versions).
 var blacksmithImage20261006 = workerEnvHost{
-	arch: "x86_64", osVersion: "24.04", goVersion: "1.26.6", dolt: "2.1.8",
+	arch: "x86_64", osVersion: "24.04", goVersion: "1.26.6", dolt: "2.6.0",
 	yq: "yq (https://github.com/mikefarah/yq/) version v4.47.2",
 	pkgs: map[string]string{
 		"bash": "5.2.21-2ubuntu4", "coreutils": "9.4-3ubuntu6.1", "curl": "8.5.0-2ubuntu10.6",
@@ -433,7 +433,7 @@ func TestRBEWorkerEnvScript(t *testing.T) {
 		t.Fatalf("worker-env: %v\n%s", err, got)
 	}
 	want := `arch x86_64
-dolt dolt version 2.1.8
+dolt dolt version 2.6.0
 go go version go1.26.6 linux/amd64
 os ubuntu 24.04
 pkg bash 5.2
@@ -559,7 +559,7 @@ func TestRBEWorkerEnvKeysToolchainNotPatches(t *testing.T) {
 		{"python minor", func(h *workerEnvHost) { h.pkgs["python3"] = "3.13.1-1" }, false},
 		{"yq major", func(h *workerEnvHost) { h.yq = "yq (https://github.com/mikefarah/yq/) version v5.0.0" }, false},
 		{"Go", func(h *workerEnvHost) { h.goVersion = "1.26.7" }, false},
-		{"dolt", func(h *workerEnvHost) { h.dolt = "2.1.9" }, false},
+		{"dolt", func(h *workerEnvHost) { h.dolt = "2.6.1" }, false},
 		{"package removed", func(h *workerEnvHost) { delete(h.pkgs, "jq") }, false},
 		{"second architecture", func(h *workerEnvHost) { h.pkgs["zlib1g"] = "1:1.3.dfsg-3.1ubuntu2.2 1:1.2.13-1" }, false},
 	} {
