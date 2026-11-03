@@ -12,7 +12,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +25,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	grpcstats "google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -98,6 +103,9 @@ type upstream struct {
 	mu    sync.Mutex
 	calls []string
 	fail  map[string]error
+	// fmbNone: FindMissingBlobs answers "nothing missing" (an empty
+	// response) instead of echoing its request.
+	fmbNone bool
 }
 
 func (u *upstream) handle(_ any, ss grpc.ServerStream) error {
@@ -123,6 +131,12 @@ func (u *upstream) handle(_ any, ss grpc.ServerStream) error {
 	if method == readMethod {
 		r, _ := parseReadRequest(reqs[0])
 		return ss.SendMsg(&frame{b: readResp([]byte("UPSTREAM " + r.resource))})
+	}
+	u.mu.Lock()
+	none := u.fmbNone
+	u.mu.Unlock()
+	if none && strings.HasSuffix(method, "/FindMissingBlobs") {
+		return ss.SendMsg(&frame{b: []byte{}})
 	}
 	for _, r := range reqs {
 		if err := ss.SendMsg(&frame{b: r}); err != nil {
@@ -154,6 +168,12 @@ type r2 struct {
 }
 
 func (r *r2) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Only the tier's objects: something on this host probes local ports
+	// (GET /), and that must not count.
+	if !strings.HasPrefix(req.URL.Path, "/h/oss/") {
+		http.NotFound(w, req)
+		return
+	}
 	name := strings.TrimPrefix(req.URL.Path, "/h/oss/")
 	r.mu.Lock()
 	r.gets[name]++
@@ -215,15 +235,26 @@ type promoter struct {
 }
 
 func (p *promoter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || r.URL.Path != promotePath {
+		http.NotFound(w, r) // a stray local probe, not the sidecar
+		return
+	}
 	var req map[string]any
 	json.NewDecoder(r.Body).Decode(&req)
 	p.mu.Lock()
 	p.reqs = append(p.reqs, req)
+	answer := p.answer
 	p.mu.Unlock()
-	code, ctype, body := p.answer(req)
+	code, ctype, body := answer(req)
 	w.Header().Set("Content-Type", ctype)
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(body)
+}
+
+func (p *promoter) set(f func(req map[string]any) (int, string, any)) {
+	p.mu.Lock()
+	p.answer = f
+	p.mu.Unlock()
 }
 
 func (p *promoter) requests() []map[string]any {
@@ -264,7 +295,7 @@ func newRig(t *testing.T, tweak func(*config)) *rig {
 	cfg := config{
 		upstream: ul.Addr().String(), hot: r2srv.URL + "/h/oss", promote: psrv.URL + promotePath,
 		tmp: t.TempDir(), min: 1024, max: 1 << 30, inflight: 4, conns: 2, r2Fails: 5, promoteFails: 3,
-		r2Timeout: 2 * time.Second, r2MBps: 50, promoteWaitMax: 5 * time.Second, breakerOpen: time.Minute,
+		r2Timeout: 2 * time.Second, r2MBps: 50, promoteWaitMax: 5 * time.Second, breakerOpen: time.Minute, slotWait: 2 * time.Second,
 	}
 	if tweak != nil {
 		tweak(&cfg)
@@ -379,10 +410,10 @@ func Test404PromoteThenHit(t *testing.T) {
 	b := blob(200<<10, 3)
 	h, n := digestOf(b)
 	z := zstdOf(t, b)
-	rg.prom.answer = func(req map[string]any) (int, string, any) {
+	rg.prom.set(func(req map[string]any) (int, string, any) {
 		rg.r2.put(objectName(h, n), z)
 		return 200, "application/json", map[string]string{"key": "h/oss/" + objectName(h, n)}
-	}
+	})
 	got := rg.read(t, readResource(h, n), 0, 0)
 	if !bytes.Equal(got, z) {
 		t.Fatal("not served from R2 after the promotion")
@@ -422,7 +453,7 @@ func Test404PromoteRefusedFallsBack(t *testing.T) {
 			rg := newRig(t, nil)
 			b := blob(100<<10, 4)
 			h, n := digestOf(b)
-			rg.prom.answer = func(map[string]any) (int, string, any) { return c.code, c.ctype, c.body }
+			rg.prom.set(func(map[string]any) (int, string, any) { return c.code, c.ctype, c.body })
 			res := readResource(h, n)
 			if got := rg.read(t, res, 0, 0); !bytes.Equal(got, upstreamAnswer(res)) {
 				t.Fatalf("got %q, want the upstream's answer", got)
@@ -441,9 +472,9 @@ func TestCorruptObjectFallsBackAndIsReported(t *testing.T) {
 	bad := append([]byte(nil), b...)
 	bad[len(bad)-1] ^= 0xff // same size, other content
 	rg.r2.put(objectName(h, n), zstdOf(t, bad))
-	rg.prom.answer = func(map[string]any) (int, string, any) {
+	rg.prom.set(func(map[string]any) (int, string, any) {
 		return 200, "application/json", map[string]string{"key": "h/oss/" + objectName(h, n)}
-	}
+	})
 	res := readResource(h, n)
 	// Not one R2 byte before verification: the answer is the upstream's alone.
 	if got := rg.read(t, res, 0, 0); !bytes.Equal(got, upstreamAnswer(res)) {
@@ -595,7 +626,7 @@ func TestWAFRefusalIsAnR2ErrorNotAPromotion(t *testing.T) {
 
 func TestPromoteBreaker(t *testing.T) {
 	rg := newRig(t, func(c *config) { c.promoteFails = 2 })
-	rg.prom.answer = func(map[string]any) (int, string, any) { return 502, "text/plain", "bad gateway" }
+	rg.prom.set(func(map[string]any) (int, string, any) { return 502, "text/plain", "bad gateway" })
 	for i := 0; i < 4; i++ {
 		b := blob(32<<10, int64(200+i))
 		h, n := digestOf(b)
@@ -762,5 +793,298 @@ func TestParseFlags(t *testing.T) {
 		if _, err := parseFlags(append(append([]string(nil), base...), extra...)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// --- keepalive ---------------------------------------------------------------
+
+// connCounter counts HTTP/2 transports the server set up (stats.ConnBegin):
+// a GOAWAY makes the client set up another. A stray non-gRPC probe of the
+// port never gets that far.
+type connCounter struct {
+	mu   sync.Mutex
+	n    int
+	addr string
+}
+
+func (c *connCounter) TagRPC(ctx context.Context, _ *grpcstats.RPCTagInfo) context.Context {
+	return ctx
+}
+func (c *connCounter) HandleRPC(context.Context, grpcstats.RPCStats) {}
+func (c *connCounter) TagConn(ctx context.Context, _ *grpcstats.ConnTagInfo) context.Context {
+	return ctx
+}
+func (c *connCounter) HandleConn(_ context.Context, st grpcstats.ConnStats) {
+	if _, ok := st.(*grpcstats.ConnBegin); ok {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
+	}
+}
+
+func (c *connCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func (c *connCounter) Addr() string { return c.addr }
+
+// serveCounting serves rg's sidecar again, its transports counted.
+func serveCounting(t *testing.T, rg *rig) *connCounter {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := &connCounter{addr: l.Addr().String()}
+	g := rg.srv.grpcServer(grpc.StatsHandler(cc))
+	go g.Serve(l)
+	t.Cleanup(g.Stop)
+	return cc
+}
+
+// A client that pings while idle, as NativeLink does, keeps its one
+// connection: no GOAWAY too_many_pings (grpc-go clamps a client's ping
+// interval to 10 s, so 35 s is three pings with no stream open).
+func TestIdlePingsKeepTheConnection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("35 s idle")
+	}
+	rg := newRig(t, nil)
+	cl := serveCounting(t, rg)
+	cc, err := grpc.NewClient("passthrough:///"+cl.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 10 * time.Second, Timeout: 5 * time.Second, PermitWithoutStream: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	fmb := "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs"
+	call := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var out frame
+		return cc.Invoke(ctx, fmb, &frame{b: []byte{0x0a, 0x03, 'o', 's', 's'}}, &out)
+	}
+	if err := call(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(35 * time.Second)
+	if err := call(); err != nil {
+		t.Fatalf("after idle pings: %v", err)
+	}
+	if n := cl.count(); n != 1 {
+		t.Errorf("%d connections, want 1 (the server sent GOAWAY too_many_pings)", n)
+	}
+}
+
+// The pinned NativeLink (1.7.1) as the client, as on a pool VM: a GrpcStore
+// with experimental_remote_cache_compression behind a fast_slow, its
+// default keepalive (30 s pings, keep_alive_while_idle). Two reads around
+// RBE_HOT_IDLE (default 3m) of idle: both are served from the hot tier,
+// decoded and verified by NativeLink itself, over one connection.
+// RBE_NL_BIN, or ~/.cache/rbe-plan/nl-1.7.1/nativelink; skipped without one.
+func TestNativeLinkClientAcrossIdle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("minutes of idle")
+	}
+	bin := os.Getenv("RBE_NL_BIN")
+	if bin == "" {
+		home, _ := os.UserHomeDir()
+		bin = filepath.Join(home, ".cache/rbe-plan/nl-1.7.1/nativelink")
+	}
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("no NativeLink binary (%s; set RBE_NL_BIN)", bin)
+	}
+	idle := 3 * time.Minute
+	if v := os.Getenv("RBE_HOT_IDLE"); v != "" {
+		var err error
+		if idle, err = time.ParseDuration(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rg := newRig(t, nil)
+	rg.up.fmbNone = true // FastSlowStore asks the slow store's has() first
+	cl := serveCounting(t, rg)
+	blobs := [][]byte{blob(300<<10, 31), blob(400<<10, 32)}
+	for _, b := range blobs {
+		h, n := digestOf(b)
+		rg.r2.put(objectName(h, n), zstdOf(t, b))
+	}
+	nl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nlAddr := nl.Addr().String()
+	nl.Close()
+	dir := t.TempDir()
+	cfg := fmt.Sprintf(`{"stores": [
+  {"name": "REMOTE_READ", "grpc": {"instance_name": "oss", "endpoints": [{"address": "grpc://%s"}], "store_type": "cas",
+    "experimental_remote_cache_compression": true}},
+  {"name": "WFS", "fast_slow": {"fast": {"memory": {"eviction_policy": {"max_bytes": 100000000}}},
+    "slow": {"ref_store": {"name": "REMOTE_READ"}}}}],
+ "servers": [{"listener": {"http": {"socket_address": "%s"}},
+   "services": {"bytestream": [{"instance_name": "oss", "cas_store": "WFS"}]}}]}`, cl.Addr(), nlAddr)
+	if err := os.WriteFile(filepath.Join(dir, "nl.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logf, _ := os.Create(filepath.Join(dir, "nl.log"))
+	cmd := exec.Command(bin, filepath.Join(dir, "nl.json"))
+	cmd.Stdout, cmd.Stderr = logf, logf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	var cc *grpc.ClientConn
+	for i := 0; i < 100; i++ {
+		if c, err := net.Dial("tcp", nlAddr); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	cc, err = grpc.NewClient("passthrough:///"+nlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{}), grpc.MaxCallRecvMsgSize(maxMsg)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	read := func(b []byte) {
+		t.Helper()
+		h, n := digestOf(b)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cs, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true}, readMethod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs.SendMsg(&frame{b: readReq(fmt.Sprintf("oss/blobs/%s/%d", h, n), 0, 0)})
+		cs.CloseSend()
+		var msgs [][]byte
+		for {
+			f := &frame{}
+			if err := cs.RecvMsg(f); err != nil {
+				if err != io.EOF {
+					log, _ := os.ReadFile(filepath.Join(dir, "nl.log"))
+					t.Fatalf("read through NativeLink: %v\n%s", err, tail(log, 3000))
+				}
+				break
+			}
+			msgs = append(msgs, f.b)
+		}
+		if got := respData(t, msgs); !bytes.Equal(got, b) {
+			t.Fatalf("NativeLink returned %d bytes, want the blob's %d", len(got), len(b))
+		}
+	}
+	read(blobs[0])
+	time.Sleep(idle)
+	read(blobs[1])
+	if g := rg.up.count(readMethod); g != 0 {
+		t.Errorf("%d reads reached the upstream, want 0 (both from R2)", g)
+	}
+	if n := cl.count(); n != 1 {
+		log, _ := os.ReadFile(filepath.Join(dir, "nl.log"))
+		t.Errorf("NativeLink dialed the sidecar %d times, want 1 (GOAWAY?)\n%s", n, tail(log, 3000))
+	}
+	if r := rg.srv.report(); !strings.Contains(r, "r2_hits=2 ") {
+		t.Errorf("report %q", r)
+	}
+}
+
+func tail(b []byte, n int) []byte {
+	if len(b) > n {
+		return b[len(b)-n:]
+	}
+	return b
+}
+
+// Every R2 GET carries its own query string (no edge copy answers it).
+func TestEveryGetHasItsOwnQuery(t *testing.T) {
+	rg := newRig(t, nil)
+	var mu sync.Mutex
+	var qs []string
+	inner := rg.r2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		qs = append(qs, r.URL.RawQuery)
+		mu.Unlock()
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	rg.srv.cfg.hot = srv.URL + "/h/oss"
+	b := blob(64<<10, 40)
+	h, n := digestOf(b)
+	rg.prom.set(func(map[string]any) (int, string, any) {
+		rg.r2.put(objectName(h, n), zstdOf(t, b))
+		return 200, "application/json", map[string]string{"key": "h/oss/" + objectName(h, n)}
+	})
+	rg.read(t, readResource(h, n), 0, 0)
+	if len(qs) != 2 || qs[0] == qs[1] || !regexp.MustCompile(`^r=[0-9a-f]{16}$`).MatchString(qs[0]) {
+		t.Errorf("queries %q, want two distinct r=<16 hex>", qs)
+	}
+}
+
+func TestNotFoundAfterPromoteIsCounted(t *testing.T) {
+	rg := newRig(t, nil)
+	b := blob(64<<10, 41)
+	h, n := digestOf(b)
+	rg.prom.set(func(map[string]any) (int, string, any) {
+		return 200, "application/json", map[string]string{"key": "h/oss/" + objectName(h, n)}
+	})
+	res := readResource(h, n)
+	if got := rg.read(t, res, 0, 0); !bytes.Equal(got, upstreamAnswer(res)) {
+		t.Fatal("not the upstream's answer")
+	}
+	if r := rg.srv.report(); !strings.Contains(r, "not_found_after_promote=1 ") {
+		t.Errorf("report %q", r)
+	}
+}
+
+func TestBusySlotsFallBackQuickly(t *testing.T) {
+	rg := newRig(t, func(c *config) { c.inflight = 1; c.slotWait = 200 * time.Millisecond })
+	rg.srv.sem <- struct{}{} // the one slot, taken
+	b := blob(64<<10, 42)
+	h, n := digestOf(b)
+	rg.r2.put(objectName(h, n), zstdOf(t, b))
+	res := readResource(h, n)
+	t0 := time.Now()
+	if got := rg.read(t, res, 0, 0); !bytes.Equal(got, upstreamAnswer(res)) {
+		t.Fatal("not the upstream's answer")
+	}
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Errorf("waited %v for a slot", d)
+	}
+	if r := rg.srv.report(); !strings.Contains(r, "busy=1 ") {
+		t.Errorf("report %q", r)
+	}
+}
+
+func TestFullDiskIsNoVerifyFailure(t *testing.T) {
+	rg := newRig(t, nil)
+	b := blob(64<<10, 43)
+	h, n := digestOf(b)
+	rg.r2.put(objectName(h, n), zstdOf(t, b))
+	rg.srv.cfg.tmp = "/dev/full-no-such-dir" // CreateTemp fails: a local error
+	res := readResource(h, n)
+	if got := rg.read(t, res, 0, 0); !bytes.Equal(got, upstreamAnswer(res)) {
+		t.Fatal("not the upstream's answer")
+	}
+	r := rg.srv.report()
+	if !strings.Contains(r, "local_errors=1") || !strings.Contains(r, "verify_fail=0 ") || !strings.Contains(r, "r2_errors=0 ") {
+		t.Errorf("report %q", r)
+	}
+	// Not marked bad: once the disk is back, R2 again.
+	rg.srv.cfg.tmp = t.TempDir()
+	if got := rg.read(t, res, 0, 0); bytes.Equal(got, upstreamAnswer(res)) {
+		t.Error("a local error marked the key bad")
+	}
+}
+
+func TestWriteErrorMidObjectIsLocal(t *testing.T) {
+	w := &fileWriter{f: nil}
+	w.err = io.ErrShortWrite
+	if _, err := w.Write([]byte("x")); err != io.ErrShortWrite {
+		t.Fatal(err)
 	}
 }

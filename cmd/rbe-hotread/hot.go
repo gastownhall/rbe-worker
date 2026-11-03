@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -93,6 +95,7 @@ func (b *breaker) ok() {
 
 type stats struct {
 	reads, big, r2Hits, r2Bytes, rawBytes, promoted, r2NotFound, r2Errors  atomic.Int64
+	notFoundAfterPromote, busy, localErrors                                atomic.Int64
 	fallbacks, verifyFail, bypassed, coreBytes, repeatDigests, repeatBytes atomic.Int64
 }
 
@@ -133,13 +136,18 @@ func statfsFree(dir string) (uint64, error) {
 	return st.Bavail * uint64(st.Bsize), nil
 }
 
-func (s *server) grpcServer() *grpc.Server {
-	return grpc.NewServer(
+func (s *server) grpcServer(extra ...grpc.ServerOption) *grpc.Server {
+	return grpc.NewServer(append([]grpc.ServerOption{
+		// NativeLink's GrpcStore pings every 30 s, idle or not
+		// (tls_utils.rs: keep_alive_while_idle). grpc-go's default policy
+		// (5 min, no pings without a stream) answers that with GOAWAY
+		// too_many_pings after about 2 idle minutes.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 5 * time.Second, PermitWithoutStream: true}),
 		grpc.ForceServerCodec(rawCodec{}),
 		grpc.UnknownServiceHandler(s.handle),
 		grpc.MaxRecvMsgSize(maxMsg), grpc.MaxSendMsgSize(maxMsg),
-		grpc.InitialWindowSize(8<<20), grpc.InitialConnWindowSize(64<<20),
-	)
+		grpc.InitialWindowSize(8 << 20), grpc.InitialConnWindowSize(64 << 20),
+	}, extra...)...)
 }
 
 // handle serves every method: Read may come from R2, the rest is relayed.
@@ -272,7 +280,24 @@ const (
 	resNotFound
 	resR2Error
 	resVerifyFail
+	resLocal
 )
+
+// fileWriter keeps the temp file's first write error apart from the
+// decoder's: a full disk is no verification failure.
+type fileWriter struct {
+	f   *os.File
+	err error
+}
+
+func (w *fileWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.f.Write(p)
+	w.err = err
+	return n, err
+}
 
 // tryHot serves d from R2 when it can. served false: nothing was sent, the
 // caller proxies; served true: the response went out (err: sending failed).
@@ -289,15 +314,27 @@ func (s *server) tryHot(ss grpc.ServerStream, d digest) (served bool, err error)
 		return false, nil
 	}
 	ctx := ss.Context()
+	// A free fetch slot within -slot-wait, else today's path at once.
+	wait := time.NewTimer(s.cfg.slotWait)
 	select {
 	case s.sem <- struct{}{}:
+		wait.Stop()
+	case <-wait.C:
+		s.st.busy.Add(1)
+		return false, nil
 	case <-ctx.Done():
+		wait.Stop()
 		return false, nil
 	}
 	defer func() { <-s.sem }()
 	f, zn, res := s.fetch(ctx, d)
 	if res == resNotFound && s.promoteOnce(ctx, d, false) {
 		f, zn, res = s.fetch(ctx, d)
+		if res == resNotFound {
+			// The core said it is in R2 and R2 says it is not: a stale
+			// (edge-cached) 404 or a lost upload. Should stay about 0.
+			s.st.notFoundAfterPromote.Add(1)
+		}
 	}
 	switch res {
 	case resOK:
@@ -403,7 +440,13 @@ func (s *server) fetch(ctx context.Context, d digest) (*os.File, int64, result) 
 			s.r2Error()
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.hot+"/"+objectName(d.hash, d.size), nil)
+	// A query string of its own on every GET: Cloudflare's cache keys on it,
+	// so no edge copy (a 404 from before the promotion above all) answers
+	// this read; R2 ignores it (the B3 pre-check confirms both).
+	var q [8]byte
+	rand.Read(q[:])
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		s.cfg.hot+"/"+objectName(d.hash, d.size)+"?r="+hex.EncodeToString(q[:]), nil)
 	if err != nil {
 		r2Error()
 		return nil, 0, resR2Error
@@ -429,11 +472,13 @@ func (s *server) fetch(ctx context.Context, d digest) (*os.File, int64, result) 
 	}
 	f, err := os.CreateTemp(s.cfg.tmp, d.key+".*.zst")
 	if err != nil {
-		return nil, 0, resR2Error // this VM's disk: not R2's fault, no breaker
+		s.st.localErrors.Add(1)
+		return nil, 0, resLocal // this VM's disk: not R2's fault, no breaker
 	}
 	os.Remove(f.Name()) // the fd alone: nothing is left behind, whatever happens
 	body := &bodyReader{r: io.LimitReader(resp.Body, zmax+1)}
-	tee := io.TeeReader(body, f)
+	fw := &fileWriter{f: f}
+	tee := io.TeeReader(body, fw)
 	dec, err := zstd.NewReader(tee, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(maxWindow),
 		zstd.WithDecoderMaxMemory(uint64(d.size)+maxWindow))
 	if err != nil {
@@ -447,6 +492,12 @@ func (s *server) fetch(ctx context.Context, d digest) (*os.File, int64, result) 
 	// Whatever follows the frames is not the core's object either.
 	extra, _ := io.Copy(io.Discard, tee)
 	switch {
+	case fw.err != nil:
+		// This VM's disk (full, an IO error): neither R2's fault nor the
+		// object's. No breaker, no bad mark: today's path for this read.
+		f.Close()
+		s.st.localErrors.Add(1)
+		return nil, 0, resLocal
 	case body.err != nil || ctx.Err() != nil:
 		// Truncated, reset or slow: R2's (or the path's) fault.
 		f.Close()
@@ -590,7 +641,13 @@ func (s *server) proxy(ss grpc.ServerStream, method string, first *frame, count 
 }
 
 func (s *server) report() string {
-	s.reportWG.Wait()
+	// Background bad reports get 2 s more at most: the line goes out first.
+	done := make(chan struct{})
+	go func() { s.reportWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
 	s.mu.Lock()
 	w := append([]float64(nil), s.waits...)
 	s.mu.Unlock()
@@ -602,10 +659,11 @@ func (s *server) report() string {
 	st := &s.st
 	return fmt.Sprintf("rbe-hot: reads=%d big=%d r2_hits=%d r2_bytes=%d raw_bytes=%d promoted=%d promote_wait_s_p50=%s"+
 		" r2_404=%d r2_errors=%d fallbacks=%d verify_fail=%d bypassed=%d core_bytes=%d repeat_digests=%d repeat_bytes=%d"+
-		" r2_breaker_opened=%d promote_breaker_opened=%d",
+		" r2_breaker_opened=%d promote_breaker_opened=%d not_found_after_promote=%d busy=%d local_errors=%d",
 		st.reads.Load(), st.big.Load(), st.r2Hits.Load(), st.r2Bytes.Load(), st.rawBytes.Load(), st.promoted.Load(), p50,
 		st.r2NotFound.Load(), st.r2Errors.Load(), st.fallbacks.Load(), st.verifyFail.Load(), st.bypassed.Load(),
-		st.coreBytes.Load(), st.repeatDigests.Load(), st.repeatBytes.Load(), s.r2.openedCount(), s.prom.openedCount())
+		st.coreBytes.Load(), st.repeatDigests.Load(), st.repeatBytes.Load(), s.r2.openedCount(), s.prom.openedCount(),
+		st.notFoundAfterPromote.Load(), st.busy.Load(), st.localErrors.Load())
 }
 
 func (b *breaker) openedCount() int {

@@ -218,6 +218,7 @@ func TestRBEWorkerScriptSlotEgress(t *testing.T) {
 		"meta skuid 59000-59063 ip daddr " + rbeSlotRefusedV4 + " reject with icmpx admin-prohibited",
 		"update @slot_dst",
 		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
+		"meta skuid 59000-59063 oif lo tcp sport 50090 drop",
 	} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("slot egress rules missing %q", want)
@@ -245,6 +246,8 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 		// The hot sidecar (rbe-hotread) holds the worker certificate's reads:
 		// refused to slots before loopback is accepted.
 		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
+		// Nor may a slot serve on its port (a listener there answers nothing).
+		"meta skuid 59000-59063 oif lo tcp sport 50090 drop",
 		"oif lo accept",
 		"$dns_allow",
 		"meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset",
@@ -267,11 +270,11 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 	// Nothing else in the output chain: no accept or reject slipped in between.
 	var verdicts []string
 	for _, l := range rules {
-		if strings.Contains(l, "accept") || strings.Contains(l, "reject") || l == "$dns_allow" {
+		if strings.Contains(l, "accept") || strings.Contains(l, "reject") || strings.HasSuffix(l, " drop") || l == "$dns_allow" {
 			verdicts = append(verdicts, l)
 		}
 	}
-	if got, want := len(verdicts), 8; got != want {
+	if got, want := len(verdicts), 9; got != want {
 		t.Errorf("output chain has %d verdict rules, want %d:\n%s", got, want, strings.Join(verdicts, "\n"))
 	}
 }

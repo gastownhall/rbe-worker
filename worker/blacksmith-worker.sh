@@ -512,6 +512,7 @@ isolate() {
 			chain output {
 				type filter hook output priority 0; policy accept;
 				meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset
+				meta skuid 59000-59063 oif lo tcp sport 50090 drop
 				oif lo accept
 				$dns_allow
 				meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset
@@ -674,15 +675,42 @@ if [ -n "${hot_build_pid:-}" ]; then
 	elif ! wait "$hot_build_pid" || [ ! -x "$RUNNER_TEMP/rbe-hotread" ]; then
 		hot_off build
 	else
+		# Nor may a slot user serve on :50090 (should the sidecar be gone):
+		# what it sends from that port is dropped (nft). Probed before the
+		# sidecar takes the port: a slot listener there must never answer.
+		# NETNS=1 (fork): an action's loopback is its own, nothing to probe.
+		served=0
+		if [ "$ACTION_ISOLATION" = 1 ] && [ "${NETNS:-0}" = 0 ]; then
+			probe=$(cd "${WORK:-$ROOT/work}" && pwd -P)/hot-serve-probe-$$
+			# shellcheck disable=SC2016 # the action's own script
+			(mkdir -p "$probe/work" && cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(6)
+try:
+    c, _ = s.accept(); c.sendall(b"LEAK\n")
+except OSError:
+    pass') >/dev/null 2>&1 &
+			sp=$!
+			sleep 1
+			# A probe that never listened proves nothing: off then.
+			ss -Hltn '( sport = :50090 )' | grep -q . || served=vacuous
+			if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/50090 && read -r -t 2 x <&3 && [ "$x" = LEAK ]' 2>/dev/null; then served=1; fi
+			kill "$sp" 2>/dev/null || true
+			wait "$sp" 2>/dev/null || true
+			rm -rf "$probe"
+		fi
 		mkdir -p "$STORE/hot-tmp"
-		env -i PATH="$PATH" HOME="$HOME" "$RUNNER_TEMP/rbe-hotread" -listen 127.0.0.1:50090 -upstream "${ZSTD_READ_URL#grpcs://}" \
-			-cert "$ROOT/pki/worker.pem" -key "$ROOT/pki/worker.key" -hot "$RBE_HOT_URL" \
-			-promote "https://${ZSTD_READ_URL#grpcs://}/rbe.hot.v1.Hot/Promote" \
-			-min "${RBE_HOT_MIN_BYTES:-67108864}" -tmp "$STORE/hot-tmp" >"$RUNNER_TEMP/rbe-hot.out" 2>&1 &
-		hot_pid=$!
+		if [ "$served" = 0 ]; then
+			env -i PATH="$PATH" HOME="$HOME" "$RUNNER_TEMP/rbe-hotread" -listen 127.0.0.1:50090 -upstream "${ZSTD_READ_URL#grpcs://}" \
+				-cert "$ROOT/pki/worker.pem" -key "$ROOT/pki/worker.key" -hot "$RBE_HOT_URL" \
+				-promote "https://${ZSTD_READ_URL#grpcs://}/rbe.hot.v1.Hot/Promote" \
+				-min "${RBE_HOT_MIN_BYTES:-67108864}" -tmp "$STORE/hot-tmp" >"$RUNNER_TEMP/rbe-hot.out" 2>&1 &
+			hot_pid=$!
+		fi
 		up=0
 		for _ in $(seq 1 50); do
-			kill -0 "$hot_pid" 2>/dev/null || break
+			[ -n "$hot_pid" ] && kill -0 "$hot_pid" 2>/dev/null || break
 			if (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null; then up=1; break; fi
 			sleep 0.2
 		done
@@ -698,12 +726,17 @@ if [ -n "${hot_build_pid:-}" ]; then
 			rm -rf "$probe"
 			if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then refused=0; fi
 		fi
-		if [ "$up" != 1 ]; then
+		if [ "$served" = 1 ]; then
+			hot_off "slot-serves-sidecar-port"
+		elif [ "$served" = vacuous ]; then
+			hot_off "serve-probe-did-not-listen"
+		elif [ "$up" != 1 ]; then
 			hot_off start
 		elif [ "$refused" != 1 ]; then
 			hot_off "slot-reaches-sidecar"
 		else
 			echo "ok    action: hot sidecar refused (127.0.0.1:50090)"
+			[ "$ACTION_ISOLATION" != 1 ] || [ "${NETNS:-0}" != 0 ] || echo "ok    action: cannot serve on 127.0.0.1:50090"
 			HOT_READ_URL=grpc://127.0.0.1:50090
 			render
 			echo "rbe-hot: status=on url=$RBE_HOT_URL min=${RBE_HOT_MIN_BYTES:-67108864}"
@@ -751,6 +784,10 @@ else
 	started=$SECONDS idle=0
 	while kill -0 "$nl" 2>/dev/null; do
 		sweep
+		# The hot sidecar is REMOTE_READ: gone, every fetch would fail.
+		# Retire (never restart it: a VM's sidecar is trusted only as started
+		# and probed above); the pool dispatches a fresh VM.
+		if [ -n "${hot_pid:-}" ] && ! kill -0 "$hot_pid" 2>/dev/null; then echo "rbe-hot: sidecar exited, retiring"; break; fi
 		inflight=$(find "${WORK:-$ROOT/work}" -mindepth 1 -maxdepth 1 -type d | wc -l)
 		if [ "$inflight" -eq 0 ]; then idle=$((idle + 30)); else idle=0; fi
 		[ "$idle" -ge $((POOL_IDLE_MINUTES * 60)) ] && { echo "idle ${POOL_IDLE_MINUTES}m, retiring"; break; }
@@ -767,15 +804,19 @@ grep -E 'registered|GoingAway|ERROR' "$ROOT/worker.log" | tail -20 || true
 # printed when it stops, after NativeLink.
 if [ -n "${hot_pid:-}" ]; then
 	kill -TERM "$hot_pid" 2>/dev/null || true
-	timeout 15 tail --pid="$hot_pid" -f /dev/null || kill -KILL "$hot_pid" 2>/dev/null || true
+	timeout 8 tail --pid="$hot_pid" -f /dev/null || kill -KILL "$hot_pid" 2>/dev/null || true
 	grep -m1 '^rbe-hot: ' "$RUNNER_TEMP/rbe-hot.out" || { echo "rbe-hot: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-hot.out" || true; }
 fi
 # P5: what this VM cost rbe-west (bytes received on the default route since boot,
-# the local CAS size) and how many compressed reads fell back or failed.
+# the local CAS size) and how many compressed reads fell back or failed; and
+# NativeLink's remote connections dropped (GOAWAY too_many_pings) or redialled
+# (the hot tier's go/no-go compares them per arm).
 dev=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1); exit }')
 echo "rbe-pull: tier=$WORKER_TIER zstd=$wire_zstd rx_bytes=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null || echo ?)" \
 	"cas_bytes=$(du -sb "$STORE/content" | cut -f1) zstd_fallbacks=$(grep -c 'falling back to identity' "$ROOT/worker.log" || true)" \
-	"zstd_refused=$(grep -c 'refusing identity fallback' "$ROOT/worker.log" || true)"
+	"zstd_refused=$(grep -c 'refusing identity fallback' "$ROOT/worker.log" || true)" \
+	"goaway_pings=$(grep -c 'too_many_pings' "$ROOT/worker.log" || true)" \
+	"reconnects=$(grep -c 'Connection failed, reconnecting' "$ROOT/worker.log" || true)"
 # Boot to first action: seconds from registration to the first action received
 # and to the first one executing (its inputs fetched), and the actions run.
 python3 - "$ROOT/worker.log" <<'PY' || true

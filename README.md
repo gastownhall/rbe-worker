@@ -49,8 +49,14 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   (modules checked against `go.sum`), fronts REMOTE_READ on
   `127.0.0.1:50090`: a big compressed read comes from R2 once its SHA-256
   matches, everything else and every failure from the zread host. Slot users
-  are refused it (nft). Unset, or any build or start failure, leaves today's
-  `worker.json`.
+  are refused it, and nothing a slot user sends from its port leaves (nft;
+  both probed before REMOTE_READ points at it). A pool worker whose sidecar
+  exits retires. Unset, or any build or start failure, leaves today's
+  `worker.json`. The loopback hop is plaintext h2c, trusted by uid alone;
+  the longer-term hardening is a per-boot CA (the sidecar serving TLS that
+  NativeLink's REMOTE_READ pins), so no other local process could stand in
+  for it even if the nft rules were lost. `rbe-pull:` also counts
+  `goaway_pings` and `reconnects` from NativeLink's log (per-arm go/no-go).
 - **Exit codes:** 2 for configuration, 3 for drift in measure mode.
 
 ## Client contract

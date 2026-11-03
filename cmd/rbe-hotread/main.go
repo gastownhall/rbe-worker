@@ -27,6 +27,8 @@
 //	rbe-hot: reads=N big=N r2_hits=N r2_bytes=N raw_bytes=N promoted=N
 //	  promote_wait_s_p50=X r2_404=N r2_errors=N fallbacks=N verify_fail=N
 //	  bypassed=N core_bytes=N repeat_digests=N repeat_bytes=N
+//	  r2_breaker_opened=N promote_breaker_opened=N not_found_after_promote=N
+//	  busy=N local_errors=N
 package main
 
 import (
@@ -41,19 +43,21 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sync"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
 
 type config struct {
-	listen, upstream, cert, key, hot, promote, tmp string
-	min, max                                       int64
-	inflight, conns, r2Fails, promoteFails         int
-	r2Timeout, promoteWaitMax, breakerOpen         time.Duration
-	r2MBps                                         float64
+	listen, upstream, cert, key, hot, promote, tmp   string
+	min, max                                         int64
+	inflight, conns, r2Fails, promoteFails           int
+	r2Timeout, promoteWaitMax, breakerOpen, slotWait time.Duration
+	r2MBps                                           float64
 }
 
 // The hot tier's base URL: https, a host, and the tier's own prefix (h/oss
@@ -80,6 +84,7 @@ func parseFlags(args []string) (config, error) {
 	fs.Float64Var(&c.r2MBps, "r2-mbps", 50, "slowest R2 rate (MB/s) a GET may take")
 	fs.DurationVar(&c.promoteWaitMax, "promote-wait-max", 30*time.Second, "longest wait for a promotion")
 	fs.DurationVar(&c.breakerOpen, "breaker-open", 5*time.Minute, "how long a breaker bypasses R2 or promotion")
+	fs.DurationVar(&c.slotWait, "slot-wait", 2*time.Second, "longest wait for one of -inflight fetch slots, then the upstream")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
@@ -142,8 +147,13 @@ func main() {
 	g := s.grpcServer()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	var once sync.Once
+	printReport := func() { once.Do(func() { fmt.Println(s.report()) }) }
 	go func() {
 		<-sig
+		// The counters first (NativeLink has stopped by then), so a slow
+		// shutdown never loses the retire line.
+		printReport()
 		done := make(chan struct{})
 		go func() { g.GracefulStop(); close(done) }()
 		select {
@@ -156,7 +166,7 @@ func main() {
 	if err := g.Serve(lis); err != nil {
 		fmt.Fprintln(os.Stderr, "rbe-hotread:", err)
 	}
-	fmt.Println(s.report())
+	printReport()
 }
 
 // r2Client reads the hot tier anonymously over IPv4 (the WAF allow-list is
@@ -203,6 +213,8 @@ func dialUpstream(target string, creds credentials.TransportCredentials, n int) 
 			grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{}),
 				grpc.MaxCallRecvMsgSize(maxMsg), grpc.MaxCallSendMsgSize(maxMsg)),
 			grpc.WithInitialWindowSize(8<<20), grpc.WithInitialConnWindowSize(64<<20),
+			// As NativeLink's own endpoints to the zread host (30 s, 20 s).
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 20 * time.Second, PermitWithoutStream: true}),
 			grpc.WithUserAgent("rbe-hotread"))
 		if err != nil {
 			return nil, err

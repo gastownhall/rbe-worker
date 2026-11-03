@@ -250,8 +250,13 @@ func TestRBEWorkerHotOrder(t *testing.T) {
 		"timeout 240 go build -trimpath -o \"$RUNNER_TEMP/rbe-hotread\" ./cmd/rbe-hotread",
 		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
 		`grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out"`,
+		// A slot listener on :50090 is probed before the sidecar takes it.
+		`s.bind(("127.0.0.1", 50090))`,
+		`"$RUNNER_TEMP/rbe-hotread" -listen 127.0.0.1:50090`,
 		`HOT_READ_URL=grpc://127.0.0.1:50090`,
 		`"$NL_BIN_DIR/nativelink" "$ROOT/worker.json"`,
+		// The pool loop retires when the sidecar is gone (never restarts it).
+		`echo "rbe-hot: sidecar exited, retiring"; break`,
 		`kill -TERM "$nl"`,
 		`grep -m1 '^rbe-hot: ' "$RUNNER_TEMP/rbe-hot.out"`,
 	}
