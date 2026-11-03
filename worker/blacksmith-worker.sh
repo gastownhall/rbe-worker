@@ -79,6 +79,26 @@
 #                       75; isolation and its selftest take about 65 s)
 #   RBE_WARM_GRACE      seconds it may run on once isolation is ready (default 5):
 #                       registration waits for the warm fetch at most this long
+#   RBE_HOT_URL         optional https://HOST/h/<tier> of rbe-west's hot tier on R2
+#                       (infra README "Hot blobs on R2"): big blobs the core
+#                       published, compressed, because a pool VM asked for them.
+#                       Pool mode with RBE_WIRE_ZSTD=1 only, and the prefix must
+#                       be this tier's (h/oss for WORKER_TIER=oss, h/fork for
+#                       fork). rbe-hotread (cmd/rbe-hotread, built here from this
+#                       tree) then fronts REMOTE_READ on 127.0.0.1:50090: a
+#                       compressed read of RBE_HOT_MIN_BYTES or more comes from
+#                       R2 once its SHA-256 matches (NativeLink verifies again);
+#                       everything else, and every failure, goes to the zread
+#                       host as before. Slot users cannot reach the sidecar (nft).
+#                       Empty (default), or a build or start failure: worker.json
+#                       is today's.
+#   RBE_HOT_EVERY       1 (default): every worker. N: only runs whose
+#                       GITHUB_RUN_ID is a multiple of N (the A/B canary; keep
+#                       RBE_WARM_EVERY at 1 meanwhile, it picks the same runs).
+#   RBE_HOT_MIN_BYTES   smallest blob read from R2 (default 67108864, 64 MiB:
+#                       the core's v1 promotes cas-big/fork-big blobs alone)
+#   RBE_HOT_GRACE       seconds the sidecar's build may run on once isolation is
+#                       ready (default 20); past it the worker starts without it
 #   RBE_ACTION_ISOLATION  1 (default): every action runs as a per-action slot
 #                       user in private namespaces (below). 0: the rollback
 #                       switch, actions run as this runner user as before.
@@ -130,6 +150,22 @@ fork)
 	;;
 *) echo "WORKER_TIER must be oss or fork" >&2; exit 2 ;;
 esac
+# Hot tier (RBE_HOT_URL): decided here, built in the background once Go is
+# installed (below), started before NativeLink. Any doubt: off.
+hot=0
+if [ -n "${RBE_HOT_URL:-}" ] && [ "$WORKER_MODE" = pool ]; then
+	if [ "$wire_zstd" != true ]; then
+		echo "rbe-hot: status=off reason=needs-wire-zstd"
+	elif [[ ! $RBE_HOT_URL =~ ^https://[A-Za-z0-9.-]+/h/(oss|fork)$ ]] || [ "${BASH_REMATCH[1]}" != "$WORKER_TIER" ] ||
+		[[ ! ${RBE_HOT_EVERY:-1} =~ ^[1-9][0-9]{0,5}$ || ! ${RBE_HOT_MIN_BYTES:-67108864} =~ ^[1-9][0-9]{6,11}$ ||
+			! ${RBE_HOT_GRACE:-20} =~ ^[0-9]{1,3}$ ]]; then
+		echo "::warning title=rbe hot::RBE_HOT_URL (https://HOST/h/$WORKER_TIER), RBE_HOT_EVERY, RBE_HOT_MIN_BYTES or RBE_HOT_GRACE unusable; this worker reads the zread host alone"
+	elif ((10#${GITHUB_RUN_ID:-0} % ${RBE_HOT_EVERY:-1} != 0)); then
+		echo "rbe-hot: status=off reason=canary every=${RBE_HOT_EVERY:-1}"
+	else
+		hot=1
+	fi
+fi
 RBE_WEST_PORT=${RBE_WEST_PORT:-443}
 # measure has no farm host (RBE_WEST_HOST) and never reaches NativeLink.
 if [ "$WORKER_MODE" != measure ]; then
@@ -190,6 +226,17 @@ if ! dolt version 2>/dev/null | grep -q "$DOLT_VERSION"; then
 	echo "${DOLT_SHA256}  $RUNNER_TEMP/dolt.tgz" | sha256sum -c -
 	tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/dolt.tgz"
 	sudo cp -f "$RUNNER_TEMP/dolt-linux-amd64/bin/dolt" /usr/local/bin/dolt
+fi
+# rbe-hotread (RBE_HOT_URL): built from this pinned tree with the Go just
+# installed, its modules checked against go.sum (proxy.golang.org, never
+# rbe-west), in a clean environment, while the rest of the setup runs.
+hot_build_pid=
+if [ "$hot" = 1 ]; then
+	(cd "$HERE/.." && exec env -i PATH=/usr/local/go/bin:/usr/bin:/bin HOME="$RUNNER_TEMP/rbe-hot-home" GOTOOLCHAIN=local \
+		GOFLAGS=-mod=readonly CGO_ENABLED=0 GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
+		GOMODCACHE="$RUNNER_TEMP/rbe-hot-gomod" GOCACHE="$RUNNER_TEMP/rbe-hot-gocache" \
+		timeout 240 go build -trimpath -o "$RUNNER_TEMP/rbe-hotread" ./cmd/rbe-hotread) >"$RUNNER_TEMP/rbe-hot-build.out" 2>&1 &
+	hot_build_pid=$!
 fi
 
 # The worker-env platform property (tools/rbe/worker-env): the sha256 of this
@@ -318,7 +365,7 @@ isolation_undo() {
 render() {
 	# zstd, read, casmax and work are read as $ARGS.named with today's values as
 	# defaults, so worker.json is byte-identical to before unless they change.
-	jq -n --arg host "grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}" --arg root "$ROOT" --arg store "$STORE" --arg name "$WORKER_NAME" --argjson slots "$slots" --arg tier "${WORKER_TIER:-oss}" --arg worker_env "$WORKER_ENV" --argjson zstd "${wire_zstd:-false}" --arg read "${ZSTD_READ_URL:-grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}}" --argjson casmax "${CAS_MAX_BYTES:-150000000000}" --arg work "${WORK:-$ROOT/work}" --argjson isolation "$isolation" '
+	jq -n --arg host "grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}" --arg root "$ROOT" --arg store "$STORE" --arg name "$WORKER_NAME" --argjson slots "$slots" --arg tier "${WORKER_TIER:-oss}" --arg worker_env "$WORKER_ENV" --argjson zstd "${wire_zstd:-false}" --arg read "${ZSTD_READ_URL:-grpcs://${RBE_WEST_HOST}:${RBE_WEST_PORT:-443}}" --argjson casmax "${CAS_MAX_BYTES:-150000000000}" --arg work "${WORK:-$ROOT/work}" --arg hotread "${HOT_READ_URL:-}" --argjson isolation "$isolation" '
   { cert_file: ($root + "/pki/worker.pem"), key_file: ($root + "/pki/worker.key"),
     ca_file: "/etc/ssl/certs/ca-certificates.crt" } as $tls |
   (if $tier == "fork" then "oss-fork" else "oss" end) as $cas_instance |
@@ -331,7 +378,11 @@ render() {
         # writable listener accepts zstd. fast_direction read_only: reads try
         # REMOTE_READ, writes go to REMOTE_WRITE alone, which says false
         # explicitly so a NativeLink default can never compress an upload.
-        { name: "REMOTE_READ", grpc: { instance_name: $cas_instance, endpoints: [{ address: ($ARGS.named.read // $host), tls_config: $tls }], store_type: "cas",
+        # hotread (RBE_HOT_URL): rbe-hotread on loopback (h2c) instead, which
+        # proxies to the same zread host with the same certificate.
+        { name: "REMOTE_READ", grpc: { instance_name: $cas_instance,
+            endpoints: [(if ($ARGS.named.hotread // "") != "" then { address: $ARGS.named.hotread }
+              else { address: ($ARGS.named.read // $host), tls_config: $tls } end)], store_type: "cas",
             experimental_remote_cache_compression: true } },
         { name: "REMOTE_WRITE", grpc: { instance_name: $cas_instance, endpoints: [{ address: $host, tls_config: $tls }], store_type: "cas",
             experimental_remote_cache_compression: false } },
@@ -364,6 +415,13 @@ render() {
       } } + $isolation) } ],
     servers: []
   }' >"$ROOT/worker.json"
+}
+
+# Whether the kernel keeps 50090 out of the ephemeral range (a list of
+# ports and ranges).
+reserves_50090() {
+	awk -F, '{ for (i = 1; i <= NF; i++) { n = split($i, r, "-"); if (n == 1) r[2] = r[1]; if (r[1] + 0 <= 50090 && 50090 <= r[2] + 0) f = 1 } } END { exit !f }' \
+		/proc/sys/net/ipv4/ip_local_reserved_ports
 }
 
 isolate() {
@@ -445,6 +503,16 @@ isolate() {
 	# (IPv6 only), slots could not resolve at all: refuse. No nameserver line:
 	# glibc uses 127.0.0.1.
 	phase nft
+	# Port 50090 is the hot sidecar's (RBE_HOT_URL) and inside
+	# ip_local_port_range: reserved, so no ephemeral connect (any user's)
+	# is ever given it; explicit binds (the sidecar) are unaffected. The
+	# slot rules on it below also match the conntrack direction, so a slot's
+	# own connection that does use it (an explicit bind) passes.
+	if ! reserves_50090; then
+		reserved=$(cat /proc/sys/net/ipv4/ip_local_reserved_ports)
+		sudo sysctl -q -w net.ipv4.ip_local_reserved_ports="${reserved:+$reserved,}50090"
+	fi
+	reserves_50090 || fail "net.ipv4.ip_local_reserved_ports does not hold 50090"
 	nameservers=$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)
 	dns_v4=$(grep -E '^[0-9]+(\.[0-9]+){3}$' <<<"$nameservers" | grep -v '^127\.' | paste -sd, - | sed 's/,/, /g' || true)
 	dns_allow=
@@ -460,6 +528,9 @@ isolate() {
 			set slot_dst { type ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 1d; counter; }
 			chain output {
 				type filter hook output priority 0; policy accept;
+				meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset
+				meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop
+				meta skuid 59000-59063 oif lo tcp sport 50090 ct state invalid,untracked drop
 				oif lo accept
 				$dns_allow
 				meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset
@@ -532,6 +603,43 @@ isolate() {
 	if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then
 		fail "probe failed ($(tr '\n' ' ' <<<"$out")); RBE_ACTION_ISOLATION=0 (repository variable) is the rollback"
 	fi
+	# The slot rules on :50090 must leave a slot's own loopback traffic
+	# alone: a connect from source port 50090 (forced by bind) to another
+	# loopback server answers at once. NETNS=1: the action's own loopback.
+	if [ "${NETNS:-0}" = 0 ]; then
+		# The server takes a free port (bind 0) and names it in a file: a
+		# fixed or random pick could collide and fail isolation.
+		port_file=$RUNNER_TEMP/rbe-lo-probe-port
+		rm -f "$port_file"
+		python3 -c '
+import os, socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1); s.settimeout(5)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+try:
+    c, _ = s.accept(); c.sendall(b"OK\n")
+except OSError:
+    pass' "$port_file" &
+		srv_pid=$!
+		srv_port=
+		for _ in $(seq 1 30); do
+			[ -s "$port_file" ] && { srv_port=$(cat "$port_file"); break; }
+			sleep 0.1
+		done
+		[[ $srv_port =~ ^[0-9]{1,5}$ ]] || fail "the loopback probe's server did not start"
+		mkdir -p "$probe/work"
+		lo=$(cd "$probe/work" && timeout 10 env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
+import socket, sys
+c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+c.bind(("127.0.0.1", 50090)); c.settimeout(3); c.connect(("127.0.0.1", int(sys.argv[1])))
+print(c.recv(8).decode().strip())' "$srv_port" 2>&1) || true
+		kill "$srv_pid" 2>/dev/null || true
+		wait "$srv_pid" 2>/dev/null || true
+		rm -rf "$probe" "$port_file"
+		[ "$lo" = OK ] || fail "a slot's loopback connect from :50090 did not get through ($lo)"
+		echo "isolation probe: loopback connect from :50090 passes"
+	fi
 }
 
 plain_slots=$slots
@@ -602,6 +710,97 @@ if [ -n "${warm_pid:-}" ]; then
 	grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out" ||
 		{ echo "rbe-warm: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-warm.out" || true; }
 fi
+# Hot tier: the sidecar, once built (RBE_HOT_GRACE more seconds at most),
+# listening, and unreachable from a slot user; then worker.json's REMOTE_READ
+# is it. Anything else: the worker starts with today's worker.json.
+hot_pid=
+hot_off() { # reason
+	echo "rbe-hot: status=off reason=$1"
+	[ -z "$hot_pid" ] || { kill -TERM "$hot_pid" 2>/dev/null || true; wait "$hot_pid" 2>/dev/null || true; }
+	hot_pid=
+	tail -n 3 "$RUNNER_TEMP/rbe-hot-build.out" "$RUNNER_TEMP/rbe-hot.out" 2>/dev/null || true
+}
+if [ -n "${hot_build_pid:-}" ]; then
+	stop=$(($(date +%s) + ${RBE_HOT_GRACE:-20}))
+	while kill -0 "$hot_build_pid" 2>/dev/null && [ "$(date +%s)" -lt "$stop" ]; do sleep 0.5; done
+	if kill -0 "$hot_build_pid" 2>/dev/null; then
+		kill -TERM "$hot_build_pid" 2>/dev/null || true
+		wait "$hot_build_pid" 2>/dev/null || true
+		hot_off build-timeout
+	elif ! wait "$hot_build_pid" || [ ! -x "$RUNNER_TEMP/rbe-hotread" ]; then
+		hot_off build
+	else
+		# Nor may a slot user serve on :50090 (should the sidecar be gone):
+		# what it sends from that port is dropped (nft). Probed before the
+		# sidecar takes the port: a slot listener there must never answer.
+		# NETNS=1 (fork): an action's loopback is its own, nothing to probe.
+		served=0
+		if [ "$ACTION_ISOLATION" = 1 ] && [ "${NETNS:-0}" = 0 ]; then
+			probe=$(cd "${WORK:-$ROOT/work}" && pwd -P)/hot-serve-probe-$$
+			# shellcheck disable=SC2016 # the action's own script
+			(mkdir -p "$probe/work" && cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(2)
+try:
+    c, _ = s.accept(); c.sendall(b"LEAK\n")
+except OSError:
+    pass') >/dev/null 2>&1 &
+			sp=$!
+			# A probe that never listened proves nothing: off then (5 s).
+			served=vacuous
+			for _ in $(seq 1 25); do
+				if ss -Hltn '( sport = :50090 )' | grep -q .; then served=0; break; fi
+				sleep 0.2
+			done
+			if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/50090 && read -r -t 2 x <&3 && [ "$x" = LEAK ]' 2>/dev/null; then served=1; fi
+			kill "$sp" 2>/dev/null || true
+			wait "$sp" 2>/dev/null || true
+			rm -rf "$probe"
+		fi
+		mkdir -p "$STORE/hot-tmp"
+		if [ "$served" = 0 ]; then
+			env -i PATH="$PATH" HOME="$HOME" "$RUNNER_TEMP/rbe-hotread" -listen 127.0.0.1:50090 -upstream "${ZSTD_READ_URL#grpcs://}" \
+				-cert "$ROOT/pki/worker.pem" -key "$ROOT/pki/worker.key" -hot "$RBE_HOT_URL" \
+				-promote "https://${ZSTD_READ_URL#grpcs://}/rbe.hot.v1.Hot/Promote" \
+				-min "${RBE_HOT_MIN_BYTES:-67108864}" -tmp "$STORE/hot-tmp" >"$RUNNER_TEMP/rbe-hot.out" 2>&1 &
+			hot_pid=$!
+		fi
+		up=0
+		for _ in $(seq 1 50); do
+			[ -n "$hot_pid" ] && kill -0 "$hot_pid" 2>/dev/null || break
+			if (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null; then up=1; break; fi
+			sleep 0.2
+		done
+		refused=1
+		if [ "$up" = 1 ] && [ "$ACTION_ISOLATION" = 1 ]; then
+			# An action (a slot user, through the real entrypoint) must not
+			# reach it: it holds the worker certificate's reads. The canary
+			# ran isolate in a subshell, so WORK_ROOT is derived again.
+			probe=$(cd "${WORK:-$ROOT/work}" && pwd -P)/hot-probe-$$
+			# shellcheck disable=SC2016 # the action's own script
+			out=$(mkdir -p "$probe/work" && cd "$probe/work" && env -i PATH=/usr/bin:/bin "$LIB/entry" /bin/bash -c \
+				'echo "uid $(id -u)"; (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null && echo LEAK; true' 2>&1) || true
+			rm -rf "$probe"
+			if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then refused=0; fi
+		fi
+		if [ "$served" = 1 ]; then
+			hot_off "slot-serves-sidecar-port"
+		elif [ "$served" = vacuous ]; then
+			hot_off "serve-probe-did-not-listen"
+		elif [ "$up" != 1 ]; then
+			hot_off start
+		elif [ "$refused" != 1 ]; then
+			hot_off "slot-reaches-sidecar"
+		else
+			echo "ok    action: hot sidecar refused (127.0.0.1:50090)"
+			[ "$ACTION_ISOLATION" != 1 ] || [ "${NETNS:-0}" != 0 ] || echo "ok    action: cannot serve on 127.0.0.1:50090"
+			HOT_READ_URL=grpc://127.0.0.1:50090
+			render
+			echo "rbe-hot: status=on url=$RBE_HOT_URL min=${RBE_HOT_MIN_BYTES:-67108864}"
+		fi
+	fi
+fi
 # Each action's receipt is a debug line of local_worker: the boot-to-first-
 # action measurement below reads it. NativeLink 1.7.1 clears the environment
 # of every action it spawns (running_actions_manager: env_clear), so actions
@@ -643,6 +842,10 @@ else
 	started=$SECONDS idle=0
 	while kill -0 "$nl" 2>/dev/null; do
 		sweep
+		# The hot sidecar is REMOTE_READ: gone, every fetch would fail.
+		# Retire (never restart it: a VM's sidecar is trusted only as started
+		# and probed above); the pool dispatches a fresh VM.
+		if [ -n "${hot_pid:-}" ] && ! kill -0 "$hot_pid" 2>/dev/null; then echo "rbe-hot: sidecar exited, retiring"; break; fi
 		inflight=$(find "${WORK:-$ROOT/work}" -mindepth 1 -maxdepth 1 -type d | wc -l)
 		if [ "$inflight" -eq 0 ]; then idle=$((idle + 30)); else idle=0; fi
 		[ "$idle" -ge $((POOL_IDLE_MINUTES * 60)) ] && { echo "idle ${POOL_IDLE_MINUTES}m, retiring"; break; }
@@ -655,12 +858,23 @@ if kill -0 "$nl" 2>/dev/null; then
 	timeout 300 tail --pid="$nl" -f /dev/null || kill -KILL "$nl"
 fi
 grep -E 'registered|GoingAway|ERROR' "$ROOT/worker.log" | tail -20 || true
+# The hot sidecar's counters (rbe-hot: reads=... r2_hits=... verify_fail=...),
+# printed when it stops, after NativeLink.
+if [ -n "${hot_pid:-}" ]; then
+	kill -TERM "$hot_pid" 2>/dev/null || true
+	timeout 8 tail --pid="$hot_pid" -f /dev/null || kill -KILL "$hot_pid" 2>/dev/null || true
+	grep -m1 '^rbe-hot: ' "$RUNNER_TEMP/rbe-hot.out" || { echo "rbe-hot: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-hot.out" || true; }
+fi
 # P5: what this VM cost rbe-west (bytes received on the default route since boot,
-# the local CAS size) and how many compressed reads fell back or failed.
+# the local CAS size) and how many compressed reads fell back or failed; and
+# NativeLink's remote connections dropped (GOAWAY too_many_pings) or redialled
+# (the hot tier's go/no-go compares them per arm).
 dev=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1); exit }')
 echo "rbe-pull: tier=$WORKER_TIER zstd=$wire_zstd rx_bytes=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null || echo ?)" \
 	"cas_bytes=$(du -sb "$STORE/content" | cut -f1) zstd_fallbacks=$(grep -c 'falling back to identity' "$ROOT/worker.log" || true)" \
-	"zstd_refused=$(grep -c 'refusing identity fallback' "$ROOT/worker.log" || true)"
+	"zstd_refused=$(grep -c 'refusing identity fallback' "$ROOT/worker.log" || true)" \
+	"goaway_pings=$(grep -c 'too_many_pings' "$ROOT/worker.log" || true)" \
+	"reconnects=$(grep -c 'Connection failed, reconnecting' "$ROOT/worker.log" || true)"
 # Boot to first action: seconds from registration to the first action received
 # and to the first one executing (its inputs fetched), and the actions run.
 python3 - "$ROOT/worker.log" <<'PY' || true
