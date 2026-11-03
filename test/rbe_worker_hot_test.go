@@ -248,7 +248,7 @@ func TestRBEWorkerHotOrder(t *testing.T) {
 		"# Hot tier (RBE_HOT_URL): decided here",
 		`if ! /usr/local/go/bin/go version`,
 		"timeout 240 go build -trimpath -o \"$RUNNER_TEMP/rbe-hotread\" ./cmd/rbe-hotread",
-		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
+		"meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset",
 		`grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out"`,
 		// A slot listener on :50090 is probed before the sidecar takes it.
 		`s.bind(("127.0.0.1", 50090))`,
@@ -267,5 +267,46 @@ func TestRBEWorkerHotOrder(t *testing.T) {
 			t.Fatalf("%s: %q missing or out of order", rbeWorkerScript, want)
 		}
 		at += i + len(want)
+	}
+}
+
+// Port 50090 is inside ip_local_port_range: isolate() reserves it (no
+// ephemeral connect is ever given it) before the slot rules load, and the
+// rules match the conntrack direction, so a slot's own connection on it
+// passes. reserves_50090 reads the kernel's list of ports and ranges.
+func TestRBEWorkerReserves50090(t *testing.T) {
+	script := readFile(t, repoRoot(t), rbeWorkerScript)
+	fn := scriptSection(t, script, "reserves_50090() {", "\n}\n") + "\n}\n"
+	for list, want := range map[string]bool{"": false, "50090": true, "22,50090": true, "50000-50100": true,
+		"50091": false, "1-5,50080-50089": false, "50090-50090": true} {
+		dir := t.TempDir()
+		f := filepath.Join(dir, "reserved")
+		os.WriteFile(f, []byte(list+"\n"), 0o644)
+		prog := strings.ReplaceAll(fn, "/proc/sys/net/ipv4/ip_local_reserved_ports", f) + "reserves_50090\n"
+		err := exec.Command("bash", "-c", prog).Run()
+		if got := err == nil; got != want {
+			t.Errorf("reserves_50090 with %q = %v, want %v", list, got, want)
+		}
+	}
+	nft := scriptSection(t, script, "\tphase nft\n", "\tphase render\n")
+	for _, want := range []string{
+		`sudo sysctl -q -w net.ipv4.ip_local_reserved_ports="${reserved:+$reserved,}50090"`,
+		`reserves_50090 || fail "net.ipv4.ip_local_reserved_ports does not hold 50090"`,
+	} {
+		if !strings.Contains(nft, want) {
+			t.Errorf("phase nft missing %q", want)
+		}
+	}
+	if strings.Index(nft, "reserves_50090 || fail") > strings.Index(nft, "sudo nft -f -") {
+		t.Error("the port must be reserved before the slot rules load")
+	}
+	// The isolation probe also checks a slot's loopback connect from
+	// :50090 to another server gets through (OSS tier).
+	probe := scriptSection(t, script, "\tphase probe\n", "\n}\n")
+	for _, want := range []string{`c.bind(("127.0.0.1", 50090)); c.settimeout(3); c.connect(`,
+		`[ "$lo" = OK ] || fail "a slot's loopback connect from :50090 did not get through ($lo)"`} {
+		if !strings.Contains(probe, want) {
+			t.Errorf("phase probe missing %q", want)
+		}
 	}
 }

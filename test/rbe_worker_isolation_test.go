@@ -217,8 +217,8 @@ func TestRBEWorkerScriptSlotEgress(t *testing.T) {
 		"meta skuid 59000-59063 ip daddr " + rbeSlotRefusedV4 + " meta l4proto tcp reject with tcp reset",
 		"meta skuid 59000-59063 ip daddr " + rbeSlotRefusedV4 + " reject with icmpx admin-prohibited",
 		"update @slot_dst",
-		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
-		"meta skuid 59000-59063 oif lo tcp sport 50090 drop",
+		"meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset",
+		"meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop",
 	} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("slot egress rules missing %q", want)
@@ -245,9 +245,9 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 		"type filter hook output priority 0; policy accept;",
 		// The hot sidecar (rbe-hotread) holds the worker certificate's reads:
 		// refused to slots before loopback is accepted.
-		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
+		"meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset",
 		// Nor may a slot serve on its port (a listener there answers nothing).
-		"meta skuid 59000-59063 oif lo tcp sport 50090 drop",
+		"meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop",
 		"oif lo accept",
 		"$dns_allow",
 		"meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset",

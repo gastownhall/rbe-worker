@@ -49,8 +49,11 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   (modules checked against `go.sum`), fronts REMOTE_READ on
   `127.0.0.1:50090`: a big compressed read comes from R2 once its SHA-256
   matches, everything else and every failure from the zread host. Slot users
-  are refused it, and nothing a slot user sends from its port leaves (nft;
-  both probed before REMOTE_READ points at it). A pool worker whose sidecar
+  are refused it, and nothing a slot user answers from its port leaves (nft,
+  by conntrack direction, so a slot's own connections on that port pass;
+  both probed before REMOTE_READ points at it). Every isolated worker
+  reserves port 50090 (`net.ipv4.ip_local_reserved_ports`), so no ephemeral
+  connect is given it. A pool worker whose sidecar
   exits retires. Unset, or any build or start failure, leaves today's
   `worker.json`. The loopback hop is plaintext h2c, trusted by uid alone;
   the longer-term hardening is a per-boot CA (the sidecar serving TLS that

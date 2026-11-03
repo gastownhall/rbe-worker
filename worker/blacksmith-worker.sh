@@ -417,6 +417,13 @@ render() {
   }' >"$ROOT/worker.json"
 }
 
+# Whether the kernel keeps 50090 out of the ephemeral range (a list of
+# ports and ranges).
+reserves_50090() {
+	awk -F, '{ for (i = 1; i <= NF; i++) { n = split($i, r, "-"); if (n == 1) r[2] = r[1]; if (r[1] + 0 <= 50090 && 50090 <= r[2] + 0) f = 1 } } END { exit !f }' \
+		/proc/sys/net/ipv4/ip_local_reserved_ports
+}
+
 isolate() {
 	phase paths
 	# Canonical paths: the launcher compares them with the action's pwd -P.
@@ -496,6 +503,16 @@ isolate() {
 	# (IPv6 only), slots could not resolve at all: refuse. No nameserver line:
 	# glibc uses 127.0.0.1.
 	phase nft
+	# Port 50090 is the hot sidecar's (RBE_HOT_URL) and inside
+	# ip_local_port_range: reserved, so no ephemeral connect (any user's)
+	# is ever given it; explicit binds (the sidecar) are unaffected. The
+	# slot rules on it below also match the conntrack direction, so a slot's
+	# own connection that does use it (an explicit bind) passes.
+	if ! reserves_50090; then
+		reserved=$(cat /proc/sys/net/ipv4/ip_local_reserved_ports)
+		sudo sysctl -q -w net.ipv4.ip_local_reserved_ports="${reserved:+$reserved,}50090"
+	fi
+	reserves_50090 || fail "net.ipv4.ip_local_reserved_ports does not hold 50090"
 	nameservers=$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)
 	dns_v4=$(grep -E '^[0-9]+(\.[0-9]+){3}$' <<<"$nameservers" | grep -v '^127\.' | paste -sd, - | sed 's/,/, /g' || true)
 	dns_allow=
@@ -511,8 +528,8 @@ isolate() {
 			set slot_dst { type ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 1d; counter; }
 			chain output {
 				type filter hook output priority 0; policy accept;
-				meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset
-				meta skuid 59000-59063 oif lo tcp sport 50090 drop
+				meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset
+				meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop
 				oif lo accept
 				$dns_allow
 				meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset
@@ -584,6 +601,33 @@ isolate() {
 	echo "isolation probe: $(tr '\n' ' ' <<<"$out")"
 	if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then
 		fail "probe failed ($(tr '\n' ' ' <<<"$out")); RBE_ACTION_ISOLATION=0 (repository variable) is the rollback"
+	fi
+	# The slot rules on :50090 must leave a slot's own loopback traffic
+	# alone: a connect from source port 50090 (forced by bind) to another
+	# loopback server answers at once. NETNS=1: the action's own loopback.
+	if [ "${NETNS:-0}" = 0 ]; then
+		srv_port=$((50100 + RANDOM % 800))
+		python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(1); s.settimeout(5)
+try:
+    c, _ = s.accept(); c.sendall(b"OK\n")
+except OSError:
+    pass' "$srv_port" &
+		srv_pid=$!
+		sleep 0.3
+		mkdir -p "$probe/work"
+		lo=$(cd "$probe/work" && timeout 10 env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
+import socket, sys
+c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+c.bind(("127.0.0.1", 50090)); c.settimeout(3); c.connect(("127.0.0.1", int(sys.argv[1])))
+print(c.recv(8).decode().strip())' "$srv_port" 2>&1) || true
+		kill "$srv_pid" 2>/dev/null || true
+		wait "$srv_pid" 2>/dev/null || true
+		rm -rf "$probe"
+		[ "$lo" = OK ] || fail "a slot's loopback connect from :50090 did not get through ($lo)"
+		echo "isolation probe: loopback connect from :50090 passes"
 	fi
 }
 
@@ -686,15 +730,18 @@ if [ -n "${hot_build_pid:-}" ]; then
 			(mkdir -p "$probe/work" && cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
 import socket
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(6)
+s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(2)
 try:
     c, _ = s.accept(); c.sendall(b"LEAK\n")
 except OSError:
     pass') >/dev/null 2>&1 &
 			sp=$!
-			sleep 1
-			# A probe that never listened proves nothing: off then.
-			ss -Hltn '( sport = :50090 )' | grep -q . || served=vacuous
+			# A probe that never listened proves nothing: off then (5 s).
+			served=vacuous
+			for _ in $(seq 1 25); do
+				if ss -Hltn '( sport = :50090 )' | grep -q .; then served=0; break; fi
+				sleep 0.2
+			done
 			if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/50090 && read -r -t 2 x <&3 && [ "$x" = LEAK ]' 2>/dev/null; then served=1; fi
 			kill "$sp" 2>/dev/null || true
 			wait "$sp" 2>/dev/null || true
