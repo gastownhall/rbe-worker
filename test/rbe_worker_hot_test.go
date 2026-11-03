@@ -303,6 +303,10 @@ func TestRBEWorkerReserves50090(t *testing.T) {
 	// The isolation probe also checks a slot's loopback connect from
 	// :50090 to another server gets through (OSS tier).
 	probe := scriptSection(t, script, "\tphase probe\n", "\n}\n")
+	// Its server takes a free port (bind 0): never a fixed or random pick.
+	if !strings.Contains(probe, `s.bind(("127.0.0.1", 0))`) || strings.Contains(probe, "RANDOM") {
+		t.Error("the loopback probe's server must bind port 0")
+	}
 	for _, want := range []string{`c.bind(("127.0.0.1", 50090)); c.settimeout(3); c.connect(`,
 		`[ "$lo" = OK ] || fail "a slot's loopback connect from :50090 did not get through ($lo)"`} {
 		if !strings.Contains(probe, want) {

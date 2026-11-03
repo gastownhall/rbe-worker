@@ -530,6 +530,7 @@ isolate() {
 				type filter hook output priority 0; policy accept;
 				meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset
 				meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop
+				meta skuid 59000-59063 oif lo tcp sport 50090 ct state invalid,untracked drop
 				oif lo accept
 				$dns_allow
 				meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset
@@ -606,17 +607,27 @@ isolate() {
 	# alone: a connect from source port 50090 (forced by bind) to another
 	# loopback server answers at once. NETNS=1: the action's own loopback.
 	if [ "${NETNS:-0}" = 0 ]; then
-		srv_port=$((50100 + RANDOM % 800))
+		# The server takes a free port (bind 0) and names it in a file: a
+		# fixed or random pick could collide and fail isolation.
+		port_file=$RUNNER_TEMP/rbe-lo-probe-port
+		rm -f "$port_file"
 		python3 -c '
-import socket, sys
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(1); s.settimeout(5)
+import os, socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1); s.settimeout(5)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
 try:
     c, _ = s.accept(); c.sendall(b"OK\n")
 except OSError:
-    pass' "$srv_port" &
+    pass' "$port_file" &
 		srv_pid=$!
-		sleep 0.3
+		srv_port=
+		for _ in $(seq 1 30); do
+			[ -s "$port_file" ] && { srv_port=$(cat "$port_file"); break; }
+			sleep 0.1
+		done
+		[[ $srv_port =~ ^[0-9]{1,5}$ ]] || fail "the loopback probe's server did not start"
 		mkdir -p "$probe/work"
 		lo=$(cd "$probe/work" && timeout 10 env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
 import socket, sys
@@ -625,7 +636,7 @@ c.bind(("127.0.0.1", 50090)); c.settimeout(3); c.connect(("127.0.0.1", int(sys.a
 print(c.recv(8).decode().strip())' "$srv_port" 2>&1) || true
 		kill "$srv_pid" 2>/dev/null || true
 		wait "$srv_pid" 2>/dev/null || true
-		rm -rf "$probe"
+		rm -rf "$probe" "$port_file"
 		[ "$lo" = OK ] || fail "a slot's loopback connect from :50090 did not get through ($lo)"
 		echo "isolation probe: loopback connect from :50090 passes"
 	fi

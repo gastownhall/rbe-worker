@@ -219,6 +219,7 @@ func TestRBEWorkerScriptSlotEgress(t *testing.T) {
 		"update @slot_dst",
 		"meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset",
 		"meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop",
+		"meta skuid 59000-59063 oif lo tcp sport 50090 ct state invalid,untracked drop",
 	} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("slot egress rules missing %q", want)
@@ -248,6 +249,8 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 		"meta skuid 59000-59063 oif lo tcp dport 50090 ct direction original reject with tcp reset",
 		// Nor may a slot serve on its port (a listener there answers nothing).
 		"meta skuid 59000-59063 oif lo tcp sport 50090 ct direction reply drop",
+		// Nor packets whose conntrack orientation could be gamed.
+		"meta skuid 59000-59063 oif lo tcp sport 50090 ct state invalid,untracked drop",
 		"oif lo accept",
 		"$dns_allow",
 		"meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset",
@@ -274,7 +277,7 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 			verdicts = append(verdicts, l)
 		}
 	}
-	if got, want := len(verdicts), 9; got != want {
+	if got, want := len(verdicts), 10; got != want {
 		t.Errorf("output chain has %d verdict rules, want %d:\n%s", got, want, strings.Join(verdicts, "\n"))
 	}
 }
