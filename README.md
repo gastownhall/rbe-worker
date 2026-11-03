@@ -18,6 +18,7 @@ client/
   setup-bazel/            # shared Bazel CI setup, consumed by both products' setup-bazel wrappers
   ci-analytics/           # the CI-analytics extractor
 cmd/product-check/        # cross-repo contract checks (below)
+cmd/rbe-hotread/          # the pool VM's hot-tier sidecar (below), built on the VM from this tree
 bin/bump-summary          # a worker-pin bump PR's step-summary body
 test/                     # go test ./... : worker, client and product-fixture tests
 docs/provenance/          # the gascity and beads commit maps this history was filtered from
@@ -34,13 +35,22 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   hardening slice; `run` was removed).
 - **Log lines** other systems read: `isolation: <phase>`,
   `worker <name> started (pid …`, `RBE_ISOLATION_CANARY=`, `worker-env: `,
-  `rbe-pull: `, `rbe-first-exec: `, and with a warm set `rbe-warm: ` and
-  `rbe-warm-audit: `.
+  `rbe-pull: `, `rbe-first-exec: `, with a warm set `rbe-warm: ` and
+  `rbe-warm-audit: `, and with the hot tier `rbe-hot: `.
 - **Warm set (optional, pool mode):** `RBE_WARM_URL` (an `https://` base
   serving `current.json` and `chunks/`), `RBE_WARM_EVERY`,
   `RBE_WARM_SECONDS`, `RBE_WARM_GRACE`. `worker/warm-cas` fetches it before
   NativeLink starts and re-hashes every blob. Unset means a cold CAS; an
   unusable value warns and starts cold, never exit 2.
+- **Hot tier (optional, pool mode with `RBE_WIRE_ZSTD=1`):** `RBE_HOT_URL`
+  (`https://HOST/h/oss` or `/h/fork`, this tier's prefix alone),
+  `RBE_HOT_EVERY`, `RBE_HOT_MIN_BYTES`, `RBE_HOT_GRACE` (infra README "Hot
+  blobs on R2"). `cmd/rbe-hotread`, built on the VM from the pinned tree
+  (modules checked against `go.sum`), fronts REMOTE_READ on
+  `127.0.0.1:50090`: a big compressed read comes from R2 once its SHA-256
+  matches, everything else and every failure from the zread host. Slot users
+  are refused it (nft). Unset, or any build or start failure, leaves today's
+  `worker.json`.
 - **Exit codes:** 2 for configuration, 3 for drift in measure mode.
 
 ## Client contract

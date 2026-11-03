@@ -217,6 +217,7 @@ func TestRBEWorkerScriptSlotEgress(t *testing.T) {
 		"meta skuid 59000-59063 ip daddr " + rbeSlotRefusedV4 + " meta l4proto tcp reject with tcp reset",
 		"meta skuid 59000-59063 ip daddr " + rbeSlotRefusedV4 + " reject with icmpx admin-prohibited",
 		"update @slot_dst",
+		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
 	} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("slot egress rules missing %q", want)
@@ -241,6 +242,9 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 	rules := slotEgressRules(t, readFile(t, repoRoot(t), rbeWorkerScript))
 	order := []string{
 		"type filter hook output priority 0; policy accept;",
+		// The hot sidecar (rbe-hotread) holds the worker certificate's reads:
+		// refused to slots before loopback is accepted.
+		"meta skuid 59000-59063 oif lo tcp dport 50090 reject with tcp reset",
 		"oif lo accept",
 		"$dns_allow",
 		"meta skuid 59000-59063 meta nfproto ipv6 meta l4proto tcp reject with tcp reset",
@@ -267,7 +271,7 @@ func TestRBEWorkerScriptSlotEgressRuleOrder(t *testing.T) {
 			verdicts = append(verdicts, l)
 		}
 	}
-	if got, want := len(verdicts), 7; got != want {
+	if got, want := len(verdicts), 8; got != want {
 		t.Errorf("output chain has %d verdict rules, want %d:\n%s", got, want, strings.Join(verdicts, "\n"))
 	}
 }
