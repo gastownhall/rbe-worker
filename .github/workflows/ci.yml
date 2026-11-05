@@ -74,6 +74,15 @@ jobs:
           go-version-file: go.mod
       - name: go test -tags integration ./...
         run: go test -tags integration ./...
+      # The isolation phases end to end on this runner VM, both tiers, every
+      # probe twice in one boot (test/rbe_worker_isolation_e2e_test.go): a
+      # reused probe action directory took the OSS pool down on 2026-11-04.
+      # It changes this throwaway VM (slot users, nft, sysctls; fork last:
+      # user.max_user_namespaces=0), so nothing runs after it.
+      - name: isolation end to end (oss, fork)
+        run: |
+          sudo apt-get update -qq
+          RBE_E2E_ISOLATION=1 go test -tags integration -count=1 -v -run TestRBEWorkerIsolationE2E ./test/
       # TODO(H1): a worker_tier: [oss, fork] matrix running
       # WORKER_MODE=selftest WORKER_TIER=<tier> worker/blacksmith-worker.sh,
       # once H1 lands (§9 "H1. WORKER_MODE=selftest"). Left as a single job
