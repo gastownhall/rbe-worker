@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -302,7 +303,7 @@ func TestRBEWorkerReserves50090(t *testing.T) {
 	}
 	// The isolation probe also checks a slot's loopback connect from
 	// :50090 to another server gets through (OSS tier).
-	probe := scriptSection(t, script, "\tphase probe\n", "\n}\n")
+	probe := scriptSection(t, script, "\nisolation_probes() {\n", "\n}\n")
 	// Its server takes a free port (bind 0): never a fixed or random pick.
 	if !strings.Contains(probe, `s.bind(("127.0.0.1", 0))`) || strings.Contains(probe, "RANDOM") {
 		t.Error("the loopback probe's server must bind port 0")
@@ -312,5 +313,48 @@ func TestRBEWorkerReserves50090(t *testing.T) {
 		if !strings.Contains(probe, want) {
 			t.Errorf("phase probe missing %q", want)
 		}
+	}
+}
+
+// Every probe action runs in a directory of its own (action_probe_dir):
+// rbe-action-launch allows one launch per action directory (name and
+// inode), and a name made again can get its inode back. 2026-11-04: the
+// :50090 loopback probe reused the isolation probe's directory name, and
+// every OSS pool worker failed at boot. Each "$LIB/entry" launch here comes
+// from a fresh directory; TestRBEWorkerIsolationE2E (-tags integration)
+// runs them all for real, twice.
+func TestRBEWorkerProbesTakeFreshDirectories(t *testing.T) {
+	script := readFile(t, repoRoot(t), rbeWorkerScript)
+	for _, bad := range []string{`isolation-probe-$$`, `hot-probe-$$`, `hot-serve-probe-$$`, `mkdir -p "$probe/work"`} {
+		if strings.Contains(script, bad) {
+			t.Errorf("%s: %q: a probe directory that is not fresh", rbeWorkerScript, bad)
+		}
+	}
+	calls := regexp.MustCompile(`probe=\$\(action_probe_dir ([a-z-]+)\)`).FindAllStringSubmatch(script, -1)
+	labels := map[string]bool{}
+	for _, c := range calls {
+		if labels[c[1]] {
+			t.Errorf("probe label %q used twice", c[1])
+		}
+		labels[c[1]] = true
+	}
+	// Each probe launch (cd into a probe's work/, then the entrypoint) is
+	// one action_probe_dir: as many of one as of the other.
+	launches := len(regexp.MustCompile(`cd "\$probe/work" && (exec )?(timeout [0-9]+ )?env -i PATH=/usr/bin:/bin "\$LIB/entry"`).FindAllString(script, -1))
+	if len(calls) != 4 || launches != len(calls) {
+		t.Errorf("%d action_probe_dir calls and %d probe launches, want 4 and 4", len(calls), launches)
+	}
+	// No probe directory is its own reason, never a probe's verdict.
+	for _, want := range []string{
+		`probe=$(action_probe_dir hot-serve-probe) || { echo probe-dir; return; }`,
+		`probe=$(action_probe_dir hot-reach-probe) || { echo probe-dir; return; }`,
+		"if [ \"$served\" = probe-dir ] || [ \"$refused\" = probe-dir ]; then\n\t\t\thot_off \"probe-dir\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("%s lacks %q", rbeWorkerScript, want)
+		}
+	}
+	if !strings.Contains(script, `d=$(mktemp -d "$root/$1-XXXXXXXX")`) {
+		t.Error("action_probe_dir must make a new directory (mktemp -d), never reuse a name")
 	}
 }

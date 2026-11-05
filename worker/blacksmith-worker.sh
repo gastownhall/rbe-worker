@@ -417,6 +417,18 @@ render() {
   }' >"$ROOT/worker.json"
 }
 
+# A fresh, unclaimed action directory for one probe action (prints its
+# path; the action runs in its work/). rbe-action-launch allows one launch
+# per action directory, ever, by name and inode, and a directory removed
+# and made again under the same name can get the same inode back: every
+# probe takes a directory of its own, never a name another probe used.
+action_probe_dir() { # label
+	local root d
+	root=$(cd "${WORK:-$ROOT/work}" && pwd -P) || return 1
+	d=$(mktemp -d "$root/$1-XXXXXXXX") || return 1
+	chmod 0755 "$d" && mkdir "$d/work" && echo "$d"
+}
+
 # Whether the kernel keeps 50090 out of the ephemeral range (a list of
 # ports and ranges).
 reserves_50090() {
@@ -585,11 +597,17 @@ isolate() {
 	grep -q '^ok    action: no-resolver' "$selftest_out" ||
 		fail "the host's resolver is reachable by actions (a DNS tunnel): $(grep -m1 'action: no-resolver' "$selftest_out")"
 	phase probe
+	isolation_probes
+}
+
+# The isolation probes (phase probe): each action in a directory of its own
+# (action_probe_dir). A function, so that a test can run them again in the
+# same boot.
+isolation_probes() {
 	# What S11.3 is about, on this VM's layout: a probe action through the real
 	# entrypoint must run as a slot user and fail to read the worker key, find
 	# this step's environment in any process, or sudo.
-	probe=$WORK_ROOT/isolation-probe-$$
-	mkdir -p "$probe/work"
+	probe=$(action_probe_dir isolation-probe) || fail "no probe action directory"
 	# shellcheck disable=SC2016 # the action's own script
 	out=$(cd "$probe/work" && env -i PATH=/usr/bin:/bin "$LIB/entry" /bin/bash -c '
 		echo "uid $(id -u)"
@@ -628,7 +646,7 @@ except OSError:
 			sleep 0.1
 		done
 		[[ $srv_port =~ ^[0-9]{1,5}$ ]] || fail "the loopback probe's server did not start"
-		mkdir -p "$probe/work"
+		probe=$(action_probe_dir isolation-probe-lo) || fail "no probe action directory"
 		lo=$(cd "$probe/work" && timeout 10 env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
 import socket, sys
 c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -710,6 +728,50 @@ if [ -n "${warm_pid:-}" ]; then
 	grep -m1 '^rbe-warm: ' "$RUNNER_TEMP/rbe-warm.out" ||
 		{ echo "rbe-warm: status=error reason=no-report"; tail -n 3 "$RUNNER_TEMP/rbe-warm.out" || true; }
 fi
+# Hot sidecar probes (RBE_HOT_URL), each action in a directory of its own.
+# hot_serve_probe (before the sidecar takes :50090; OSS tier): a slot
+# listener on 50090 must never answer. Prints 0 (it did not), 1 (it did),
+# vacuous (it never listened: proves nothing) or probe-dir (no directory
+# for the probe action).
+hot_serve_probe() {
+	local probe served=vacuous sp
+	probe=$(action_probe_dir hot-serve-probe) || { echo probe-dir; return; }
+	# shellcheck disable=SC2016 # the action's own script
+	(cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(2)
+try:
+    c, _ = s.accept(); c.sendall(b"LEAK\n")
+except OSError:
+    pass') >/dev/null 2>&1 &
+	sp=$!
+	# A probe that never listened proves nothing: off then (5 s).
+	for _ in $(seq 1 25); do
+		if ss -Hltn '( sport = :50090 )' | grep -q .; then served=0; break; fi
+		sleep 0.2
+	done
+	if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/50090 && read -r -t 2 x <&3 && [ "$x" = LEAK ]' 2>/dev/null; then served=1; fi
+	kill "$sp" 2>/dev/null || true
+	wait "$sp" 2>/dev/null || true
+	rm -rf "$probe"
+	echo "$served"
+}
+
+# hot_reach_probe (the sidecar listening): a slot user must not connect to
+# it. Prints 1 (refused), 0 or probe-dir (no directory for the probe action).
+hot_reach_probe() {
+	# An action (a slot user, through the real entrypoint) must not
+	# reach it: it holds the worker certificate's reads.
+	local probe out
+	probe=$(action_probe_dir hot-reach-probe) || { echo probe-dir; return; }
+	# shellcheck disable=SC2016 # the action's own script
+	out=$(cd "$probe/work" && env -i PATH=/usr/bin:/bin "$LIB/entry" /bin/bash -c \
+		'echo "uid $(id -u)"; (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null && echo LEAK; true' 2>&1) || true
+	rm -rf "$probe"
+	if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then echo 0; else echo 1; fi
+}
+
 # Hot tier: the sidecar, once built (RBE_HOT_GRACE more seconds at most),
 # listening, and unreachable from a slot user; then worker.json's REMOTE_READ
 # is it. Anything else: the worker starts with today's worker.json.
@@ -735,29 +797,7 @@ if [ -n "${hot_build_pid:-}" ]; then
 		# sidecar takes the port: a slot listener there must never answer.
 		# NETNS=1 (fork): an action's loopback is its own, nothing to probe.
 		served=0
-		if [ "$ACTION_ISOLATION" = 1 ] && [ "${NETNS:-0}" = 0 ]; then
-			probe=$(cd "${WORK:-$ROOT/work}" && pwd -P)/hot-serve-probe-$$
-			# shellcheck disable=SC2016 # the action's own script
-			(mkdir -p "$probe/work" && cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
-import socket
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 50090)); s.listen(1); s.settimeout(2)
-try:
-    c, _ = s.accept(); c.sendall(b"LEAK\n")
-except OSError:
-    pass') >/dev/null 2>&1 &
-			sp=$!
-			# A probe that never listened proves nothing: off then (5 s).
-			served=vacuous
-			for _ in $(seq 1 25); do
-				if ss -Hltn '( sport = :50090 )' | grep -q .; then served=0; break; fi
-				sleep 0.2
-			done
-			if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/50090 && read -r -t 2 x <&3 && [ "$x" = LEAK ]' 2>/dev/null; then served=1; fi
-			kill "$sp" 2>/dev/null || true
-			wait "$sp" 2>/dev/null || true
-			rm -rf "$probe"
-		fi
+		if [ "$ACTION_ISOLATION" = 1 ] && [ "${NETNS:-0}" = 0 ]; then served=$(hot_serve_probe); fi
 		mkdir -p "$STORE/hot-tmp"
 		if [ "$served" = 0 ]; then
 			env -i PATH="$PATH" HOME="$HOME" "$RUNNER_TEMP/rbe-hotread" -listen 127.0.0.1:50090 -upstream "${ZSTD_READ_URL#grpcs://}" \
@@ -773,18 +813,10 @@ except OSError:
 			sleep 0.2
 		done
 		refused=1
-		if [ "$up" = 1 ] && [ "$ACTION_ISOLATION" = 1 ]; then
-			# An action (a slot user, through the real entrypoint) must not
-			# reach it: it holds the worker certificate's reads. The canary
-			# ran isolate in a subshell, so WORK_ROOT is derived again.
-			probe=$(cd "${WORK:-$ROOT/work}" && pwd -P)/hot-probe-$$
-			# shellcheck disable=SC2016 # the action's own script
-			out=$(mkdir -p "$probe/work" && cd "$probe/work" && env -i PATH=/usr/bin:/bin "$LIB/entry" /bin/bash -c \
-				'echo "uid $(id -u)"; (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null && echo LEAK; true' 2>&1) || true
-			rm -rf "$probe"
-			if ! grep -qE "^uid 590[0-9]{2}$" <<<"$out" || grep -q LEAK <<<"$out"; then refused=0; fi
-		fi
-		if [ "$served" = 1 ]; then
+		if [ "$up" = 1 ] && [ "$ACTION_ISOLATION" = 1 ]; then refused=$(hot_reach_probe); fi
+		if [ "$served" = probe-dir ] || [ "$refused" = probe-dir ]; then
+			hot_off "probe-dir"
+		elif [ "$served" = 1 ]; then
 			hot_off "slot-serves-sidecar-port"
 		elif [ "$served" = vacuous ]; then
 			hot_off "serve-probe-did-not-listen"
