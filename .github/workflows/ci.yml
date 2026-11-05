@@ -93,8 +93,10 @@ jobs:
           # GitHub's ubuntu-24.04 image ships /etc/sudoers.d/runner mode 0644,
           # which visudo -c (isolate()'s sudoers phase) rejects as bad
           # permissions; Blacksmith's pool images ship 0440. Set what a pool
-          # VM has.
-          [ ! -f /etc/sudoers.d/runner ] || sudo chmod 0440 /etc/sudoers.d/runner
+          # VM has. (sudo test: /etc/sudoers.d is 0750 root, so the runner
+          # user cannot see into it.)
+          if sudo test -f /etc/sudoers.d/runner; then sudo chmod 0440 /etc/sudoers.d/runner; fi
+          sudo visudo -c
           RBE_E2E_ISOLATION=1 go test -tags integration -count=1 -v -run TestRBEWorkerIsolationE2E ./test/
       # TODO(H1): a worker_tier: [oss, fork] matrix running
       # WORKER_MODE=selftest WORKER_TIER=<tier> worker/blacksmith-worker.sh,
