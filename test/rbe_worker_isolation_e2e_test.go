@@ -60,8 +60,10 @@ func TestRBEWorkerIsolationE2E(t *testing.T) {
 	}
 	for _, tier := range tiers {
 		t.Run(tier, func(t *testing.T) {
+			// Cleaned up whatever happens (t.Fatal ends the function early),
+			// so the next tier boots as on a fresh VM.
+			t.Cleanup(func() { cleanupIsolation(t) })
 			runIsolationE2E(t, root, section, tier)
-			cleanupIsolation(t)
 		})
 	}
 }
@@ -108,7 +110,10 @@ fi
 echo "ROUND2-OK"
 `
 	// umask 022: blacksmith-worker.sh's own, set before this section.
-	prog := "set -euo pipefail\numask 022\n" +
+	// On a failure: the command, its line and the isolation phase, then
+	// the host facts a phase depends on (e2eDiagnostics).
+	trap := `set -E; trap 'rc=$?; echo "e2e: exit $rc at line $LINENO (${FUNCNAME[0]:-main}): $BASH_COMMAND; phase $(cat "$RUNNER_TEMP/rbe-isolation-phase" 2>/dev/null)" >&2' ERR` + "\n"
+	prog := "set -euo pipefail\numask 022\n" + trap +
 		fmt.Sprintf("ACTION_ISOLATION=1 slots=4 STORE=$ROOT WORK=$ROOT/work wire_zstd=true WORKER_TIER=%s NETNS=%s\n", tier, netns) +
 		"(exit 0) & hot_build_pid=$!\n" + section + "wait \"$nl\"\n" + round2
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
@@ -129,6 +134,7 @@ echo "ROUND2-OK"
 	// The claims first: a reused name shows even when the run stopped.
 	defer func() {
 		if runErr != nil {
+			t.Logf("tier %s diagnostics:\n%s", tier, e2eDiagnostics())
 			t.Fatalf("tier %s: the isolation sequence failed: %v", tier, runErr)
 		}
 	}()
@@ -157,7 +163,9 @@ echo "ROUND2-OK"
 		t.Errorf("tier %s: NativeLink did not start with the sidecar as REMOTE_READ (%v)", tier, err)
 	}
 	// Every launch's claim (name.inode): no action directory name twice.
-	claims, err := exec.Command("sudo", "-n", "ls", "/run/rbe-action/claims").Output()
+	// No claims directory: nothing was launched (a phase before the probes
+	// stopped the run, reported above).
+	claims, err := exec.Command("sudo", "-n", "bash", "-c", "[ ! -d /run/rbe-action/claims ] || ls /run/rbe-action/claims").Output()
 	if err != nil {
 		t.Fatalf("claims: %v", err)
 	}
@@ -205,6 +213,24 @@ true`
 	if err != nil || len(out) > 0 {
 		t.Logf("cleanup: %v\n%s", err, out)
 	}
+}
+
+// e2eDiagnostics: what the isolation phases depend on, on this host, for a
+// failed run's log.
+func e2eDiagnostics() string {
+	script := `
+set +e
+echo "## visudo -c"; visudo -c 2>&1
+echo "## /etc/sudoers.d"; ls -la /etc/sudoers.d 2>&1
+echo "## nft"; command -v nft; nft --version 2>&1; nft list tables 2>&1 | head -20
+echo "## sysctls"; for k in net.ipv4.ip_local_port_range net.ipv4.ip_local_reserved_ports kernel.apparmor_restrict_unprivileged_userns user.max_user_namespaces kernel.unprivileged_userns_clone; do echo "$k = $(sysctl -n "$k" 2>&1)"; done
+echo "## tools"; for c in gcc python3 jq ss unshare setpriv file; do printf '%s: %s\n' "$c" "$(command -v "$c" || echo missing)"; done
+echo "## resolv.conf"; grep -v '^#' /etc/resolv.conf
+echo "## mounts (home)"; findmnt -T "$HOME" 2>&1
+echo "## rbe-action.env"; cat /etc/rbe-west/rbe-action.env 2>&1
+`
+	out, _ := exec.Command("sudo", "-n", "env", "HOME="+os.Getenv("HOME"), "bash", "-c", script).CombinedOutput()
+	return string(out)
 }
 
 func tailString(s string, n int) string {
