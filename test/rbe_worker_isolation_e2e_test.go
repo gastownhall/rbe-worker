@@ -24,11 +24,13 @@ import (
 // :50090), then NativeLink's start (a stub). Then, in the same boot, every
 // probe again. Each tier in turn, the OSS tier first, cleaned up between.
 //
-// A probe that reuses an action directory name fails it two ways: the
-// launcher refuses a second launch of the same name and inode (rbe-action:
-// "action directory ... was already launched", the 2026-11-04 OSS outage),
-// and, since the inode may differ, the test also requires every claim the
-// launcher recorded to name a distinct directory.
+// The primary assertion is the claims check: every claim the launcher
+// recorded ($RUN/claims/<name>.<inode>) must name a distinct directory. A
+// probe that reuses a name fails it whatever the filesystem does. The
+// launcher's own refusal ("action directory ... was already launched", the
+// 2026-11-04 OSS outage) needs the inode to come back too, which the VM's
+// disk did and the test containers (overlayfs, a loop ext4) did not: it is
+// asserted as well, but rarely fires here.
 //
 // It changes the host (users, /usr/local/libexec/rbe-action, /etc/sudoers.d,
 // nft, sysctls; fork: user.max_user_namespaces=0), so it runs only with
@@ -105,7 +107,8 @@ if [ -n "${hot_pid:-}" ]; then
 fi
 echo "ROUND2-OK"
 `
-	prog := "set -euo pipefail\n" +
+	// umask 022: blacksmith-worker.sh's own, set before this section.
+	prog := "set -euo pipefail\numask 022\n" +
 		fmt.Sprintf("ACTION_ISOLATION=1 slots=4 STORE=$ROOT WORK=$ROOT/work wire_zstd=true WORKER_TIER=%s NETNS=%s\n", tier, netns) +
 		"(exit 0) & hot_build_pid=$!\n" + section + "wait \"$nl\"\n" + round2
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)

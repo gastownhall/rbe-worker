@@ -344,6 +344,16 @@ func TestRBEWorkerProbesTakeFreshDirectories(t *testing.T) {
 	if len(calls) != 4 || launches != len(calls) {
 		t.Errorf("%d action_probe_dir calls and %d probe launches, want 4 and 4", len(calls), launches)
 	}
+	// No probe directory is its own reason, never a probe's verdict.
+	for _, want := range []string{
+		`probe=$(action_probe_dir hot-serve-probe) || { echo probe-dir; return; }`,
+		`probe=$(action_probe_dir hot-reach-probe) || { echo probe-dir; return; }`,
+		"if [ \"$served\" = probe-dir ] || [ \"$refused\" = probe-dir ]; then\n\t\t\thot_off \"probe-dir\"",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("%s lacks %q", rbeWorkerScript, want)
+		}
+	}
 	if !strings.Contains(script, `d=$(mktemp -d "$root/$1-XXXXXXXX")`) {
 		t.Error("action_probe_dir must make a new directory (mktemp -d), never reuse a name")
 	}

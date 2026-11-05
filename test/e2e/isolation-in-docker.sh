@@ -9,10 +9,13 @@
 # caches or VM shutdown socket; another kernel config). The fork tier runs
 # in a child user namespace (below), so its root is not the host's: the
 # launcher's namespaces and remounts nest one level deeper than on a VM.
-# /home is a loop-mounted ext4 (inode reuse as on a VM disk). The OSS tier
-# runs first in the container itself, then fork: one boot, as the test
-# documents. On a real
-# runner (CI's privileged job) the test runs without this wrapper.
+# /home is a loop-mounted ext4, the closest to a VM disk here; it did not
+# hand a freed inode back in the runs so far, so the launcher's refusal of a
+# reused directory does not fire: the test's distinct-claim check is what
+# catches a reused name (TestRBEWorkerIsolationE2E). The OSS tier runs
+# first in the container itself, then fork: one boot, as the test
+# documents. On a real runner (CI's privileged job) the test runs without
+# this wrapper.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../.." && pwd -P)
 goroot=${1:-$(go env GOROOT)}
@@ -22,9 +25,9 @@ docker run --rm --privileged -v "$here:/src:ro" -v "$goroot:/opt/go:ro" -v "$mod
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null
 apt-get install -y -qq gcc libc6-dev nftables file util-linux procps python3 jq iproute2 sudo uidmap ca-certificates >/dev/null
-# /home on ext4, as a runner VM'"'"'s disk: a directory removed and made
-# again can get its inode back there (the launcher'"'"'s claims are name.inode),
-# which overlayfs and tmpfs do not do.
+# /home on ext4, as a runner VM'"'"'s disk is (tmpfs never hands an inode
+# number back; ext4 can, though it did not in these runs: the test'"'"'s
+# distinct-claim check is the assertion that catches a reused name).
 truncate -s 4G /run/home.ext4 && mkfs.ext4 -q /run/home.ext4 && mount -o loop /run/home.ext4 /home
 useradd -m -s /bin/bash runner
 echo "runner ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner

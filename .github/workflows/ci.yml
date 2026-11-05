@@ -67,6 +67,9 @@ jobs:
   # until then (no integration-tagged tests exist yet, so it passes trivially).
   privileged:
     runs-on: ubuntu-24.04
+    # The isolation end-to-end step builds and installs the launcher and runs
+    # the full selftest twice (about 2 min); a hang must not hold the check.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
@@ -80,8 +83,13 @@ jobs:
       # It changes this throwaway VM (slot users, nft, sysctls; fork last:
       # user.max_user_namespaces=0), so nothing runs after it.
       - name: isolation end to end (oss, fork)
+        timeout-minutes: 20
         run: |
-          sudo apt-get update -qq
+          for attempt in 1 2 3; do
+            sudo apt-get update -qq && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((attempt * 15))
+          done
           RBE_E2E_ISOLATION=1 go test -tags integration -count=1 -v -run TestRBEWorkerIsolationE2E ./test/
       # TODO(H1): a worker_tier: [oss, fork] matrix running
       # WORKER_MODE=selftest WORKER_TIER=<tier> worker/blacksmith-worker.sh,

@@ -730,11 +730,12 @@ if [ -n "${warm_pid:-}" ]; then
 fi
 # Hot sidecar probes (RBE_HOT_URL), each action in a directory of its own.
 # hot_serve_probe (before the sidecar takes :50090; OSS tier): a slot
-# listener on 50090 must never answer. Prints 0 (it did not), 1 (it did) or
-# vacuous (it never listened: proves nothing).
+# listener on 50090 must never answer. Prints 0 (it did not), 1 (it did),
+# vacuous (it never listened: proves nothing) or probe-dir (no directory
+# for the probe action).
 hot_serve_probe() {
 	local probe served=vacuous sp
-	probe=$(action_probe_dir hot-serve-probe) || { echo vacuous; return; }
+	probe=$(action_probe_dir hot-serve-probe) || { echo probe-dir; return; }
 	# shellcheck disable=SC2016 # the action's own script
 	(cd "$probe/work" && exec env -i PATH=/usr/bin:/bin "$LIB/entry" /usr/bin/python3 -c '
 import socket
@@ -758,12 +759,12 @@ except OSError:
 }
 
 # hot_reach_probe (the sidecar listening): a slot user must not connect to
-# it. Prints 1 (refused) or 0.
+# it. Prints 1 (refused), 0 or probe-dir (no directory for the probe action).
 hot_reach_probe() {
 	# An action (a slot user, through the real entrypoint) must not
 	# reach it: it holds the worker certificate's reads.
 	local probe out
-	probe=$(action_probe_dir hot-reach-probe) || { echo 0; return; }
+	probe=$(action_probe_dir hot-reach-probe) || { echo probe-dir; return; }
 	# shellcheck disable=SC2016 # the action's own script
 	out=$(cd "$probe/work" && env -i PATH=/usr/bin:/bin "$LIB/entry" /bin/bash -c \
 		'echo "uid $(id -u)"; (exec 3<>/dev/tcp/127.0.0.1/50090) 2>/dev/null && echo LEAK; true' 2>&1) || true
@@ -813,7 +814,9 @@ if [ -n "${hot_build_pid:-}" ]; then
 		done
 		refused=1
 		if [ "$up" = 1 ] && [ "$ACTION_ISOLATION" = 1 ]; then refused=$(hot_reach_probe); fi
-		if [ "$served" = 1 ]; then
+		if [ "$served" = probe-dir ] || [ "$refused" = probe-dir ]; then
+			hot_off "probe-dir"
+		elif [ "$served" = 1 ]; then
 			hot_off "slot-serves-sidecar-port"
 		elif [ "$served" = vacuous ]; then
 			hot_off "serve-probe-did-not-listen"
