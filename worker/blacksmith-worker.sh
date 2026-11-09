@@ -107,6 +107,14 @@
 #                       fall back to 0 instead of exiting when it fails; the
 #                       others run as 0. Logs RBE_ISOLATION_CANARY=ok,
 #                       failed phase=<phase> or skipped.
+#   RBE_DIST_MIRROR     optional https://HOST[/PREFIX] serving the pinned setup
+#                       downloads as PREFIX/<name>/<version>/<file> (infra README
+#                       "Pinned setup downloads on R2": NativeLink, Go, dolt),
+#                       tried before upstream (rbe-fetch). Untrusted transport:
+#                       every file is checked against its pinned sha256 here, and
+#                       a miss, an error or a mismatch falls through to upstream.
+#                       Empty (default) or unusable (a warning): upstream alone,
+#                       retried either way.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -166,6 +174,12 @@ if [ -n "${RBE_HOT_URL:-}" ] && [ "$WORKER_MODE" = pool ]; then
 		hot=1
 	fi
 fi
+# Setup downloads (rbe-fetch reads RBE_DIST_MIRROR from the environment): an
+# unusable mirror warns and is not used.
+if [ -n "${RBE_DIST_MIRROR:-}" ] && [[ ! $RBE_DIST_MIRROR =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]]; then
+	echo "::warning title=rbe fetch::RBE_DIST_MIRROR (https://HOST[/PREFIX]) unusable; setup downloads come from upstream alone"
+	export RBE_DIST_MIRROR=
+fi
 RBE_WEST_PORT=${RBE_WEST_PORT:-443}
 # measure has no farm host (RBE_WEST_HOST) and never reaches NativeLink.
 if [ "$WORKER_MODE" != measure ]; then
@@ -181,6 +195,16 @@ fi
 NL_VERSION=1.7.1
 NL_SHA256=a3d7abc2598e976d022fcdabe88a2f8fae46a3ae64f1868698002ca968dd88e9
 GO_VERSION=$(awk '/^go /{print $2; exit}' "$RBE_PRODUCT_ROOT/go.mod")
+# The go.mod go lines of the products this farm serves (gascity), pinned so
+# that neither the mirror nor go.dev's checksum JSON is trusted for them. Any
+# other version takes its checksum from go.dev's JSON at run time (and the
+# mirror is then checked against that).
+case "$GO_VERSION" in
+# On a Go bump add the new version's line and keep the previous one:
+# rbe-worker-legacy.yml provisions the previous Go during a grace window.
+1.27.3) GO_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40 ;;
+*) GO_SHA256= ;;
+esac
 DOLT_VERSION=2.6.0
 DOLT_SHA256=a8d4c2e2e94b85fd3592cb80748044f846ccfd03d25a536ed1f754baf7da6401
 ROOT="$RUNNER_TEMP/nl-worker"
@@ -214,15 +238,36 @@ apt_install() {
 	sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y -qq "$@" >/dev/null
 }
 apt_install "${WORKER_TOOLSET[@]}"
+# Setup downloads go through rbe-fetch: retried, RBE_DIST_MIRROR first when
+# set, each checked against its pinned sha256 whatever the source (GitHub
+# release 504s took the OSS pool down on 2026-11-08). A total failure still
+# fails setup. Every download of this VM shares one deadline, 240 s after the
+# first step that reached here (the measure step), kept in $RUNNER_TEMP so
+# that the worker step reuses it rather than starting a new one: a slow
+# outage fails setup within about 4 minutes of downloads in all (the pool
+# breaker counts a worker that lived 10 minutes as healthy). Each download is
+# bounded on its own too (rbe-fetch).
+fetch_deadline=$(cat "$RUNNER_TEMP/rbe-fetch-deadline" 2>/dev/null || :)
+if [[ ! $fetch_deadline =~ ^[1-9][0-9]{0,11}$ ]]; then
+	fetch_deadline=$(($(date +%s) + 240))
+	echo "$fetch_deadline" >"$RUNNER_TEMP/rbe-fetch-deadline"
+fi
+export RBE_FETCH_DEADLINE=$fetch_deadline
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
-	sum=$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" |
-		jq -r --arg f "go${GO_VERSION}.linux-amd64.tar.gz" '.[].files[] | select(.filename==$f) | .sha256')
-	curl -fsSL -o "$RUNNER_TEMP/go.tgz" "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
-	echo "${sum}  $RUNNER_TEMP/go.tgz" | sha256sum -c -
+	go_sum=$GO_SHA256
+	if [ -z "$go_sum" ]; then
+		"$HERE/rbe-fetch" go-checksums "$RUNNER_TEMP/go-dl.json" - 60 - "https://go.dev/dl/?mode=json&include=all"
+		go_sum=$(jq -r --arg f "go${GO_VERSION}.linux-amd64.tar.gz" '.[].files[] | select(.filename==$f) | .sha256' "$RUNNER_TEMP/go-dl.json")
+		[[ $go_sum =~ ^[0-9a-f]{64}$ ]] || { echo "rbe-worker: go.dev lists no sha256 for go${GO_VERSION}.linux-amd64.tar.gz" >&2; exit 1; }
+	fi
+	"$HERE/rbe-fetch" go "$RUNNER_TEMP/go.tgz" "$go_sum" 120 "go/${GO_VERSION}/go${GO_VERSION}.linux-amd64.tar.gz" \
+		"https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+	echo "${go_sum}  $RUNNER_TEMP/go.tgz" | sha256sum -c -
 	sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf "$RUNNER_TEMP/go.tgz"
 fi
 if ! dolt version 2>/dev/null | grep -q "$DOLT_VERSION"; then
-	curl -fsSL -o "$RUNNER_TEMP/dolt.tgz" "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
+	"$HERE/rbe-fetch" dolt "$RUNNER_TEMP/dolt.tgz" "$DOLT_SHA256" 120 "dolt/${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
+		"https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
 	echo "${DOLT_SHA256}  $RUNNER_TEMP/dolt.tgz" | sha256sum -c -
 	tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/dolt.tgz"
 	sudo cp -f "$RUNNER_TEMP/dolt-linux-amd64/bin/dolt" /usr/local/bin/dolt
@@ -265,7 +310,9 @@ if ! (cd "$RBE_PRODUCT_ROOT" && "$HERE/worker-env-drift" check "$RUNNER_TEMP/wor
 	echo "worker-env: registering anyway with worker-env=$WORKER_ENV (actions without worker-env only)"
 fi
 [ "$WORKER_MODE" != measure ] || exit 0
-curl -fsSL -o "$RUNNER_TEMP/nl.tgz" "https://github.com/TraceMachina/nativelink/releases/download/v${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+"$HERE/rbe-fetch" nativelink "$RUNNER_TEMP/nl.tgz" "$NL_SHA256" 120 \
+	"nativelink/${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+	"https://github.com/TraceMachina/nativelink/releases/download/v${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz"
 echo "${NL_SHA256}  $RUNNER_TEMP/nl.tgz" | sha256sum -c -
 mkdir -p "$NL_BIN_DIR" && tar -C "$NL_BIN_DIR" -xzf "$RUNNER_TEMP/nl.tgz" nativelink
 

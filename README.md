@@ -35,8 +35,29 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   hardening slice; `run` was removed).
 - **Log lines** other systems read: `isolation: <phase>`,
   `worker <name> started (pid …`, `RBE_ISOLATION_CANARY=`, `worker-env: `,
-  `rbe-pull: `, `rbe-first-exec: `, with a warm set `rbe-warm: ` and
-  `rbe-warm-audit: `, and with the hot tier `rbe-hot: `.
+  `rbe-pull: `, `rbe-first-exec: `, `rbe-fetch: ` (one per setup
+  download), with a warm set `rbe-warm: ` and `rbe-warm-audit: `, and with
+  the hot tier `rbe-hot: `.
+- **Setup downloads (`worker/rbe-fetch`):** NativeLink, Go (and, for a Go
+  version without a pinned `GO_SHA256`, go.dev's checksum JSON) and dolt are
+  retried (`curl --retry 5 --retry-delay 3 --retry-all-errors`) and checked
+  against their pinned sha256s. Time is bounded so that an outage fails setup
+  well inside the pool breaker's 10-minute window: the mirror about 80 s
+  (`--max-time 60 --retry-max-time 20`), upstream about 210 s (`--max-time
+  120 --retry-max-time 90`), every attempt `--speed-limit 262144
+  --speed-time 15` and `--max-filesize 268435456`. All downloads of one VM
+  share one 240 s deadline (`RBE_FETCH_DEADLINE`, kept in
+  `$RUNNER_TEMP/rbe-fetch-deadline`, so the worker step reuses the measure
+  step's), so downloads hold a VM about 245 s at most in all (each source
+  stops within 5 s of the deadline). Package installs and the rest of setup
+  come on top of that.
+  `RBE_DIST_MIRROR` (optional, an `https://` base, for example
+  `https://rbe-warm.ops.gascity.com/dist`; infra README "Pinned setup
+  downloads on R2") is tried first, at `<base>/<name>/<version>/<file>`. It
+  is untrusted transport: a miss, an error or a byte that fails the checksum
+  falls through to upstream. A total failure fails setup (exit 1), as before.
+  Each download prints `rbe-fetch: name= status= source=mirror|upstream
+  attempts= bytes= seconds= mirror=hit|off|miss|bad-sha256`.
 - **Warm set (optional, pool mode):** `RBE_WARM_URL` (an `https://` base
   serving `current.json` and `chunks/`), `RBE_WARM_EVERY`,
   `RBE_WARM_SECONDS`, `RBE_WARM_GRACE`. `worker/warm-cas` fetches it before

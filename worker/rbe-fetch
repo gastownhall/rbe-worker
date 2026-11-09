@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# rbe-fetch NAME OUT SHA256 MAX_TIME MIRROR_PATH URL
+#
+# One setup download of blacksmith-worker.sh (NativeLink, Go, dolt), retried,
+# from an optional mirror first, then upstream, and verified against its
+# pinned SHA-256 whatever the source (mc-0bqjv: on 2026-11-08 GitHub release
+# 504s killed pool workers in setup and opened the OSS pool's breaker 5 times).
+#
+# NAME         the artifact, for the log line (e.g. nativelink)
+# OUT          where the verified file goes (written as OUT.part, renamed once
+#              it matches)
+# SHA256       64 hex, the pinned checksum; or - for an unpinned lookup (Go's
+#              checksum JSON alone): upstream only, never a mirror, unverified
+# MAX_TIME     seconds one upstream attempt may take (curl --max-time, at most
+#              120); a mirror attempt takes at most 60
+# MIRROR_PATH  the key under RBE_DIST_MIRROR (e.g.
+#              nativelink/1.7.1/nativelink-1.7.1-x86_64-unknown-linux-musl.tar.gz),
+#              or - for none
+# URL          upstream
+#
+# RBE_DIST_MIRROR  optional http(s)://HOST[:PORT][/PREFIX] (the worker admits
+#              https:// alone; infra README "Pinned setup downloads on R2"),
+#              tried first. The mirror is untrusted transport: a miss, an
+#              error or a byte that fails the checksum falls through to
+#              upstream, so a bad mirror costs time, never a wrong binary.
+#              Fetched over IPv4: the warm domain's WAF admits Blacksmith's
+#              IPv4 range alone. Its 404 is not retried, so an artifact not
+#              (yet) on the mirror costs one request.
+# RBE_FETCH_DEADLINE  optional epoch seconds: the setup's shared deadline
+#              (blacksmith-worker.sh sets it). No attempt runs past it, and
+#              none starts after it.
+#
+# Time is bounded (a slow outage must fail setup well inside the pool
+# breaker's 10-minute "survived" window, and a slow mirror must not hold up a
+# healthy upstream). Every attempt: --connect-timeout 10, --speed-limit
+# 262144 --speed-time 15 (below 256 KiB/s for 15 s is a failed attempt; a
+# slow but moving path still finishes, inside --max-time and the deadline),
+# --max-filesize 268435456, redirects to https only.
+#   mirror:   --retry 2, --max-time 60 --retry-max-time 20 (about 80 s at most)
+#   upstream: --retry 5 --retry-delay 3 --retry-all-errors, --max-time MAX_TIME
+#             --retry-max-time 90 (about 210 s at most)
+# --retry-max-time also caps a server's Retry-After: curl gives up rather than
+# sleep past it. Each source also runs under timeout(1) at that bound (and the
+# deadline), whatever curl does. --retry-all-errors needs curl 7.71; without
+# it curl still retries timeouts, 408, 429 and 5xx.
+# Prints one line on stdout:
+#   rbe-fetch: name=N status=ok source=mirror|upstream attempts=N bytes=N
+#              seconds=S mirror=hit|off|miss|bad-sha256
+# attempts are those of the source used (status=failed: mirror and upstream
+# together), counted from curl's per-attempt error lines (checked on curl
+# 8.5); before curl 7.71 they are not counted (attempts=?). A total failure
+# prints status=failed on stderr and exits 1
+# (the worker's set -e then fails setup as before, so the pool breaker still
+# sees a real outage); 2 for misuse.
+set -euo pipefail
+
+[ $# = 6 ] || { echo "usage: rbe-fetch NAME OUT SHA256|- MAX_TIME MIRROR_PATH|- URL" >&2; exit 2; }
+name=$1 out=$2 want=$3 max_time=$4 mirror_path=$5 url=$6
+[[ $name =~ ^[a-z0-9-]+$ ]] || { echo "rbe-fetch: NAME must be [a-z0-9-]+" >&2; exit 2; }
+[[ $want == - || $want =~ ^[0-9a-f]{64}$ ]] || { echo "rbe-fetch: SHA256 must be 64 hex or -" >&2; exit 2; }
+[[ $max_time =~ ^[1-9][0-9]{0,2}$ && $max_time -le 120 ]] || { echo "rbe-fetch: MAX_TIME must be 1-120 seconds" >&2; exit 2; }
+[[ $mirror_path == - || ($mirror_path =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && $mirror_path != *..*) ]] ||
+	{ echo "rbe-fetch: MIRROR_PATH must be a relative key without .." >&2; exit 2; }
+[[ $url =~ ^https?:// ]] || { echo "rbe-fetch: URL must be http(s)" >&2; exit 2; }
+# Tests only: the waits between attempts (curl reads 0 as its own backoff).
+delay=${RBE_FETCH_RETRY_DELAY:-3}
+[[ $delay =~ ^[1-9][0-9]?$ ]] || { echo "rbe-fetch: RBE_FETCH_RETRY_DELAY must be 1-99 seconds" >&2; exit 2; }
+# Tests only: the low-speed window (--speed-time).
+speed_time=${RBE_FETCH_SPEED_TIME:-15}
+[[ $speed_time =~ ^[1-9][0-9]?$ ]] || { echo "rbe-fetch: RBE_FETCH_SPEED_TIME must be 1-99 seconds" >&2; exit 2; }
+deadline=${RBE_FETCH_DEADLINE:-}
+[[ -z $deadline || $deadline =~ ^[1-9][0-9]{0,11}$ ]] || { echo "rbe-fetch: RBE_FETCH_DEADLINE must be epoch seconds" >&2; exit 2; }
+
+mirror=${RBE_DIST_MIRROR:-}
+mirror_state=off
+if [ -n "$mirror" ]; then
+	if [[ ! $mirror =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?$ ]]; then
+		echo "::warning title=rbe fetch::RBE_DIST_MIRROR unusable; $name from upstream alone"
+		mirror=
+	elif [ "$want" = - ] || [ "$mirror_path" = - ]; then
+		mirror= # nothing to check a mirror's bytes against, or no key there
+	fi
+fi
+
+# --retry-all-errors arrived in curl 7.71.0 (Ubuntu 24.04, the pool image,
+# ships 8.5.0).
+all_errors=() counted=0
+if [[ $(curl --version 2>/dev/null | head -n1) =~ ^curl\ ([0-9]+)\.([0-9]+) ]] &&
+	((BASH_REMATCH[1] > 7 || (BASH_REMATCH[1] == 7 && BASH_REMATCH[2] >= 71))); then
+	all_errors=(--retry-all-errors) counted=1
+fi
+# --no-progress-meter (curl 7.67) keeps curl's "Will retry in N seconds"
+# warnings, so a source cut short while curl sleeps between retries is not
+# counted as one more attempt; older curl runs -s (and counts nothing).
+quiet=(-s)
+[ "$counted" = 0 ] || quiet=(--no-progress-meter)
+
+part=$out.part err=$out.err
+trap 'rm -f "$part" "$err"' EXIT
+start=$(date +%s)
+attempts=0 total=0
+
+# try SOURCE URL BOUND CURL_ARGS...: download to $part within BOUND seconds
+# (and the deadline) and verify it; 0 when it matches. attempts: curl's own,
+# each failed one prints a "curl: (N)" line; one cut short by timeout(1)
+# prints none, unless curl was sleeping before a retry (its last line then is
+# the "Will retry" warning, and no attempt was running).
+try() {
+	local src=$1 u=$2 bound=$3 rc=0 failed got why
+	shift 3
+	rm -f "$part" "$err"
+	if [ -n "$deadline" ] && (($(date +%s) + bound > deadline)); then
+		bound=$((deadline - $(date +%s)))
+		if ((bound < 1)); then
+			attempts=0
+			echo "rbe-fetch: name=$name source=$src attempts=0 error=\"setup deadline passed\"" >&2
+			return 1
+		fi
+	fi
+	timeout -k 5 "$bound" curl -fSL "${quiet[@]}" --proto =https,http --proto-redir =https --connect-timeout 10 \
+		--speed-limit 262144 --speed-time "$speed_time" --max-filesize 268435456 "$@" -o "$part" "$u" 2>"$err" || rc=$?
+	failed=$(grep -c '^curl: (' "$err" || :)
+	why=$(grep '^curl: (' "$err" | tail -n1 || :)
+	if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+		if tail -n1 "$err" | grep -q 'Will retry in'; then
+			why="cut short at ${bound}s between retries"
+		else
+			failed=$((failed + 1)) why="cut short at ${bound}s"
+		fi
+	fi
+	if [ "$counted" = 1 ]; then
+		attempts=$((failed + (rc == 0 ? 1 : 0))) total=$((total + attempts))
+	else
+		attempts='?' total='?'
+	fi
+	if [ "$rc" != 0 ]; then
+		echo "rbe-fetch: name=$name source=$src attempts=$attempts error=\"$why\"" >&2
+		return 1
+	fi
+	[ "$want" = - ] && return 0
+	echo "$want  $part" | sha256sum -c --status - && return 0
+	got=$(sha256sum "$part" | cut -d' ' -f1)
+	echo "rbe-fetch: name=$name source=$src sha256=$got want=$want bytes=$(stat -c %s "$part")" >&2
+	return 2
+}
+
+done_line() {
+	mv -f "$part" "$out"
+	echo "rbe-fetch: name=$name status=ok source=$1 attempts=$attempts bytes=$(stat -c %s "$out") seconds=$(($(date +%s) - start)) mirror=$mirror_state"
+	exit 0
+}
+
+if [ -n "$mirror" ]; then
+	# Transient errors alone (timeouts, 408, 429, 5xx): a 404 is a miss.
+	rc=0
+	mt=$((max_time < 60 ? max_time : 60))
+	try mirror "${mirror%/}/$mirror_path" $((mt + 20 + 5)) --ipv4 --retry 2 --retry-delay "$delay" \
+		--max-time "$mt" --retry-max-time 20 || rc=$?
+	case $rc in
+	0) mirror_state=hit && done_line mirror ;;
+	2)
+		mirror_state=bad-sha256
+		echo "::warning title=rbe fetch::$name from RBE_DIST_MIRROR failed its pinned sha256; fetching upstream"
+		;;
+	*) mirror_state=miss ;;
+	esac
+fi
+if try upstream "$url" $((max_time + 90 + 5)) --retry 5 --retry-delay "$delay" "${all_errors[@]}" \
+	--max-time "$max_time" --retry-max-time 90; then
+	done_line upstream
+fi
+echo "rbe-fetch: name=$name status=failed source=- attempts=$total bytes=0 seconds=$(($(date +%s) - start)) mirror=$mirror_state" >&2
+exit 1
