@@ -406,8 +406,9 @@ func TestRBEWorkerScriptMeasureMode(t *testing.T) {
 }
 
 // workerStubs is a host for blacksmith-worker.sh with nothing real behind
-// it: sudo and apt-get do nothing, downloads are empty files whose checksums
-// pass, the NativeLink archive unpacks to $NL_STUB, sleep returns once
+// it: sudo and apt-get do nothing, downloads are stub files whose checksums
+// pass (go.dev's checksum JSON lists the product's Go with a well-formed
+// sha256), the NativeLink archive unpacks to $NL_STUB, sleep returns once
 // NativeLink has started, and dolt, go, uname and dpkg-query describe a host
 // that is not the pinned one.
 var workerStubs = map[string]string{
@@ -415,7 +416,11 @@ var workerStubs = map[string]string{
 	"curl": `out=
 prev=
 for a; do [ "$prev" = -o ] && out=$a; prev=$a; done
-if [ -n "$out" ]; then echo stub >"$out"; else echo '[]'; fi
+case "$out" in
+'') echo '[]' ;;
+*.json | *.json.part) printf '[{"files":[{"filename":"go%s.linux-amd64.tar.gz","sha256":"%064d"}]}]\n' "$(awk '/^go /{print $2; exit}' go.mod)" 0 >"$out" ;;
+*) echo stub >"$out" ;;
+esac
 `,
 	"sha256sum": `if [ "${1:-}" = -c ]; then cat >/dev/null; exit 0; fi
 for p in /usr/bin/sha256sum /bin/sha256sum; do [ -x "$p" ] && exec "$p" "$@"; done

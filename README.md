@@ -35,8 +35,20 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   hardening slice; `run` was removed).
 - **Log lines** other systems read: `isolation: <phase>`,
   `worker <name> started (pid …`, `RBE_ISOLATION_CANARY=`, `worker-env: `,
-  `rbe-pull: `, `rbe-first-exec: `, with a warm set `rbe-warm: ` and
-  `rbe-warm-audit: `, and with the hot tier `rbe-hot: `.
+  `rbe-pull: `, `rbe-first-exec: `, `rbe-fetch: ` (one per setup
+  download), with a warm set `rbe-warm: ` and `rbe-warm-audit: `, and with
+  the hot tier `rbe-hot: `.
+- **Setup downloads (`worker/rbe-fetch`):** NativeLink, Go (and, for a Go
+  version without a pinned `GO_SHA256`, go.dev's checksum JSON) and dolt are
+  retried (`curl --retry 5 --retry-delay 3 --retry-all-errors`, a
+  per-artifact `--max-time`) and checked against their pinned sha256s.
+  `RBE_DIST_MIRROR` (optional, an `https://` base, for example
+  `https://rbe-warm.ops.gascity.com/dist`; infra README "Pinned setup
+  downloads on R2") is tried first, at `<base>/<name>/<version>/<file>`. It
+  is untrusted transport: a miss, an error or a byte that fails the checksum
+  falls through to upstream. A total failure fails setup (exit 1), as before.
+  Each download prints `rbe-fetch: name= status= source=mirror|upstream
+  attempts= bytes= seconds= mirror=hit|off|miss|bad-sha256`.
 - **Warm set (optional, pool mode):** `RBE_WARM_URL` (an `https://` base
   serving `current.json` and `chunks/`), `RBE_WARM_EVERY`,
   `RBE_WARM_SECONDS`, `RBE_WARM_GRACE`. `worker/warm-cas` fetches it before
