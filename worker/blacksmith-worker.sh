@@ -239,7 +239,10 @@ apt_install "${WORKER_TOOLSET[@]}"
 # Setup downloads go through rbe-fetch: retried, RBE_DIST_MIRROR first when
 # set, each checked against its pinned sha256 whatever the source (GitHub
 # release 504s took the OSS pool down on 2026-11-08). A total failure still
-# fails setup.
+# fails setup. All of them share one deadline, so a slow outage fails this
+# step within about 5 minutes (the pool breaker counts a worker that lived 10
+# minutes as healthy); each one is bounded on its own too (rbe-fetch).
+export RBE_FETCH_DEADLINE=$(($(date +%s) + 300))
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
 	go_sum=$GO_SHA256
 	if [ -z "$go_sum" ]; then
@@ -247,13 +250,13 @@ if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
 		go_sum=$(jq -r --arg f "go${GO_VERSION}.linux-amd64.tar.gz" '.[].files[] | select(.filename==$f) | .sha256' "$RUNNER_TEMP/go-dl.json")
 		[[ $go_sum =~ ^[0-9a-f]{64}$ ]] || { echo "rbe-worker: go.dev lists no sha256 for go${GO_VERSION}.linux-amd64.tar.gz" >&2; exit 1; }
 	fi
-	"$HERE/rbe-fetch" go "$RUNNER_TEMP/go.tgz" "$go_sum" 300 "go/${GO_VERSION}/go${GO_VERSION}.linux-amd64.tar.gz" \
+	"$HERE/rbe-fetch" go "$RUNNER_TEMP/go.tgz" "$go_sum" 120 "go/${GO_VERSION}/go${GO_VERSION}.linux-amd64.tar.gz" \
 		"https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
 	echo "${go_sum}  $RUNNER_TEMP/go.tgz" | sha256sum -c -
 	sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf "$RUNNER_TEMP/go.tgz"
 fi
 if ! dolt version 2>/dev/null | grep -q "$DOLT_VERSION"; then
-	"$HERE/rbe-fetch" dolt "$RUNNER_TEMP/dolt.tgz" "$DOLT_SHA256" 180 "dolt/${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
+	"$HERE/rbe-fetch" dolt "$RUNNER_TEMP/dolt.tgz" "$DOLT_SHA256" 120 "dolt/${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
 		"https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz"
 	echo "${DOLT_SHA256}  $RUNNER_TEMP/dolt.tgz" | sha256sum -c -
 	tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/dolt.tgz"
@@ -297,7 +300,7 @@ if ! (cd "$RBE_PRODUCT_ROOT" && "$HERE/worker-env-drift" check "$RUNNER_TEMP/wor
 	echo "worker-env: registering anyway with worker-env=$WORKER_ENV (actions without worker-env only)"
 fi
 [ "$WORKER_MODE" != measure ] || exit 0
-"$HERE/rbe-fetch" nativelink "$RUNNER_TEMP/nl.tgz" "$NL_SHA256" 180 \
+"$HERE/rbe-fetch" nativelink "$RUNNER_TEMP/nl.tgz" "$NL_SHA256" 120 \
 	"nativelink/${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
 	"https://github.com/TraceMachina/nativelink/releases/download/v${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz"
 echo "${NL_SHA256}  $RUNNER_TEMP/nl.tgz" | sha256sum -c -

@@ -9,9 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const rbeFetch = "worker/rbe-fetch"
@@ -225,9 +228,10 @@ func TestRBEFetchUnpinnedSkipsMirror(t *testing.T) {
 		t.Errorf("a file:// mirror: %v\n%s", err, out)
 	}
 	for _, args := range [][]string{
-		{"nl", "o", "abc", "20", "-", srv.URL},            // not a sha256
-		{"nl", "o", "-", "20", "../etc/passwd", srv.URL},  // traversal
-		{"nl", "o", "-", "0", "-", srv.URL},               // max time
+		{"nl", "o", "abc", "20", "-", srv.URL},           // not a sha256
+		{"nl", "o", "-", "20", "../etc/passwd", srv.URL}, // traversal
+		{"nl", "o", "-", "0", "-", srv.URL},
+		{"nl", "o", "-", "121", "-", srv.URL},             // max time
 		{"nl", "o", "-", "20", "-", "file:///etc/passwd"}, // upstream scheme
 		{"NL", "o", "-", "20", "-", srv.URL},              // name
 		{"nl", "o", "-", "20", "-"},                       // arity
@@ -261,13 +265,18 @@ func TestRBEFetchOldCurlWithoutRetryAllErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("curl %s: %v\n%s", tc.version, err, out)
 		}
-		wantLine(t, out, `status=ok source=upstream attempts=2 `)
+		// Before 7.71 the attempts are not counted: no number is made up.
+		wantAttempts := map[string]string{"7.68.0": `\?`, "8.5.0": "2"}[tc.version]
+		wantLine(t, out, `status=ok source=upstream attempts=`+wantAttempts+` `)
 		args, _ := os.ReadFile(log)
 		if got := map[bool]string{true: "present", false: "absent"}[strings.Contains(string(args), "--retry-all-errors")]; got != tc.want {
 			t.Errorf("curl %s: --retry-all-errors %s, want %s (%s)", tc.version, got, tc.want, args)
 		}
-		if !strings.Contains(string(args), "--retry 5 --retry-delay 1") || !strings.Contains(string(args), "--connect-timeout 10 --max-time 20") {
-			t.Errorf("curl %s args: %s", tc.version, args)
+		for _, want := range []string{"--retry 5 --retry-delay 1", "--connect-timeout 10", "--max-time 20 --retry-max-time 90",
+			"--speed-limit 1048576 --speed-time 15", "--max-filesize 268435456", "--proto-redir =https"} {
+			if !strings.Contains(string(args), want) {
+				t.Errorf("curl %s args lack %q: %s", tc.version, want, args)
+			}
 		}
 	}
 }
@@ -285,10 +294,13 @@ func TestRBEWorkerSetupDownloadsUseRBEFetch(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"$HERE/rbe-fetch" go-checksums "$RUNNER_TEMP/go-dl.json" - 60 - "https://go.dev/dl/?mode=json&include=all"`,
-		`"$HERE/rbe-fetch" go "$RUNNER_TEMP/go.tgz" "$go_sum" 300 "go/${GO_VERSION}/go${GO_VERSION}.linux-amd64.tar.gz"`,
-		`"$HERE/rbe-fetch" dolt "$RUNNER_TEMP/dolt.tgz" "$DOLT_SHA256" 180 "dolt/${DOLT_VERSION}/dolt-linux-amd64.tar.gz"`,
-		`"$HERE/rbe-fetch" nativelink "$RUNNER_TEMP/nl.tgz" "$NL_SHA256" 180`,
+		`"$HERE/rbe-fetch" go "$RUNNER_TEMP/go.tgz" "$go_sum" 120 "go/${GO_VERSION}/go${GO_VERSION}.linux-amd64.tar.gz"`,
+		`"$HERE/rbe-fetch" dolt "$RUNNER_TEMP/dolt.tgz" "$DOLT_SHA256" 120 "dolt/${DOLT_VERSION}/dolt-linux-amd64.tar.gz"`,
+		`"$HERE/rbe-fetch" nativelink "$RUNNER_TEMP/nl.tgz" "$NL_SHA256" 120`,
 		`"nativelink/${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz"`,
+		// One deadline for every setup download, well inside the pool
+		// breaker's 10-minute "survived" window.
+		"\nexport RBE_FETCH_DEADLINE=$(($(date +%s) + 300))\n" + `if ! /usr/local/go/bin/go version`,
 		// Only https:// reaches rbe-fetch from the workflow.
 		`[[ ! $RBE_DIST_MIRROR =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]]`,
 	} {
@@ -307,5 +319,111 @@ func TestRBEWorkerSetupDownloadsUseRBEFetch(t *testing.T) {
 	}
 	if info, err := os.Stat(filepath.Join(root, rbeFetch)); err != nil || info.Mode().Perm()&0o111 == 0 {
 		t.Errorf("%s must be executable: %v", rbeFetch, err)
+	}
+}
+
+// retryAfterServer answers every GET 503 with Retry-After: 600 and counts them.
+func retryAfterServer(t *testing.T) (*httptest.Server, *int32) {
+	t.Helper()
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		w.Header().Set("Retry-After", "600")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &n
+}
+
+// trickleServer promises 1 MiB and sends 64 bytes every 200 ms, until the
+// client goes away.
+func trickleServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		w.WriteHeader(http.StatusOK)
+		for {
+			if _, err := w.Write(make([]byte, 64)); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}))
+	t.Cleanup(srv.CloseClientConnections)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A Retry-After: 600 outage, mirror and upstream, fails at once: curl will not
+// sleep past --retry-max-time (unbounded, it slept for the header's 10
+// minutes per retry).
+func TestRBEFetchRetryAfterOutageFailsFast(t *testing.T) {
+	srv, n := retryAfterServer(t)
+	start := time.Now()
+	out, _, err := runFetch(t, srv.URL+"/dist", sha256Hex([]byte("x")), "nl/1/nl.tgz", srv.URL+"/up/nl.tgz")
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		t.Fatalf("rbe-fetch: %v, want exit 1\n%s", err, out)
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Errorf("a Retry-After: 600 outage held rbe-fetch for %v, want under 15 s", d)
+	}
+	wantLine(t, out, `status=failed .* mirror=miss$`)
+	if got := atomic.LoadInt32(n); got < 2 {
+		t.Errorf("requests = %d, want the mirror and upstream both tried", got)
+	}
+}
+
+// A trickling mirror (below the speed limit) is given up on, and a healthy
+// upstream still serves within the mirror's bound.
+func TestRBEFetchTricklingMirrorFallsBackInTime(t *testing.T) {
+	body := []byte("nativelink tarball")
+	mirror := trickleServer(t)
+	up := newFetchServer(t, body, map[string][]int{"/up/nl.tgz": {200}})
+	start := time.Now()
+	out, file, err := runFetch(t, mirror.URL, sha256Hex(body), "nl/1/nl.tgz", up.URL+"/up/nl.tgz", "RBE_FETCH_SPEED_TIME=2")
+	if err != nil {
+		t.Fatalf("rbe-fetch: %v\n%s", err, out)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("a trickling mirror held rbe-fetch for %v, want under 20 s", d)
+	}
+	wantFile(t, file, body)
+	wantLine(t, out, `status=ok source=upstream attempts=1 .* mirror=miss$`)
+	if !strings.Contains(out, "error=\"curl: (28)") {
+		t.Errorf("the mirror's attempts were not cut by the speed limit:\n%s", out)
+	}
+}
+
+// Trickling everywhere: the setup deadline ends it, mid-attempt, and one that
+// has passed already starts nothing.
+func TestRBEFetchDeadlineBoundsATricklingOutage(t *testing.T) {
+	srv := trickleServer(t)
+	start := time.Now()
+	deadline := strconv.FormatInt(time.Now().Add(6*time.Second).Unix(), 10)
+	out, file, err := runFetch(t, srv.URL+"/dist", sha256Hex([]byte("x")), "nl/1/nl.tgz", srv.URL+"/up/nl.tgz",
+		"RBE_FETCH_SPEED_TIME=60", "RBE_FETCH_DEADLINE="+deadline)
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		t.Fatalf("rbe-fetch: %v, want exit 1\n%s", err, out)
+	}
+	if d := time.Since(start); d > 12*time.Second {
+		t.Errorf("rbe-fetch ran %v past a 6 s deadline", d)
+	}
+	if !strings.Contains(out, "cut short at ") || !strings.Contains(out, "setup deadline passed") {
+		t.Errorf("want the mirror cut short and upstream refused by the deadline:\n%s", out)
+	}
+	wantLine(t, out, `status=failed `)
+	if _, err := os.Stat(file + ".part"); err == nil {
+		t.Error("a cut-short download was left behind")
+	}
+
+	up := newFetchServer(t, []byte("x"), map[string][]int{"/up": {200}})
+	out, _, err = runFetch(t, "", sha256Hex([]byte("x")), "-", up.URL+"/up", "RBE_FETCH_DEADLINE=1000000000")
+	if err == nil || up.count("/up") != 0 || !strings.Contains(out, "attempts=0 error=\"setup deadline passed\"") {
+		t.Errorf("a passed deadline: %v, %d requests\n%s", err, up.count("/up"), out)
 	}
 }

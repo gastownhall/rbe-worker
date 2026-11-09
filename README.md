@@ -40,8 +40,13 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   the hot tier `rbe-hot: `.
 - **Setup downloads (`worker/rbe-fetch`):** NativeLink, Go (and, for a Go
   version without a pinned `GO_SHA256`, go.dev's checksum JSON) and dolt are
-  retried (`curl --retry 5 --retry-delay 3 --retry-all-errors`, a
-  per-artifact `--max-time`) and checked against their pinned sha256s.
+  retried (`curl --retry 5 --retry-delay 3 --retry-all-errors`) and checked
+  against their pinned sha256s. Time is bounded so that an outage fails setup
+  well inside the pool breaker's 10-minute window: the mirror about 80 s
+  (`--max-time 60 --retry-max-time 20`), upstream about 210 s (`--max-time
+  120 --retry-max-time 90`), every attempt `--speed-limit 1048576
+  --speed-time 15` and `--max-filesize 268435456`, and all downloads of one
+  run share a 5-minute deadline (`RBE_FETCH_DEADLINE`).
   `RBE_DIST_MIRROR` (optional, an `https://` base, for example
   `https://rbe-warm.ops.gascity.com/dist`; infra README "Pinned setup
   downloads on R2") is tried first, at `<base>/<name>/<version>/<file>`. It
