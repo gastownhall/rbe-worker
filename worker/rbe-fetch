@@ -33,7 +33,8 @@
 # Time is bounded (a slow outage must fail setup well inside the pool
 # breaker's 10-minute "survived" window, and a slow mirror must not hold up a
 # healthy upstream). Every attempt: --connect-timeout 10, --speed-limit
-# 1048576 --speed-time 15 (below 1 MiB/s for 15 s is a failed attempt),
+# 262144 --speed-time 15 (below 256 KiB/s for 15 s is a failed attempt; a
+# slow but moving path still finishes, inside --max-time and the deadline),
 # --max-filesize 268435456, redirects to https only.
 #   mirror:   --retry 2, --max-time 60 --retry-max-time 20 (about 80 s at most)
 #   upstream: --retry 5 --retry-delay 3 --retry-all-errors, --max-time MAX_TIME
@@ -45,9 +46,10 @@
 # Prints one line on stdout:
 #   rbe-fetch: name=N status=ok source=mirror|upstream attempts=N bytes=N
 #              seconds=S mirror=hit|off|miss|bad-sha256
-# attempts are those of the source used, counted from curl's per-attempt
-# error lines (checked on curl 8.5); before curl 7.71 they are not counted
-# (attempts=?). A total failure prints status=failed on stderr and exits 1
+# attempts are those of the source used (status=failed: mirror and upstream
+# together), counted from curl's per-attempt error lines (checked on curl
+# 8.5); before curl 7.71 they are not counted (attempts=?). A total failure
+# prints status=failed on stderr and exits 1
 # (the worker's set -e then fails setup as before, so the pool breaker still
 # sees a real outage); 2 for misuse.
 set -euo pipefail
@@ -87,16 +89,22 @@ if [[ $(curl --version 2>/dev/null | head -n1) =~ ^curl\ ([0-9]+)\.([0-9]+) ]] &
 	((BASH_REMATCH[1] > 7 || (BASH_REMATCH[1] == 7 && BASH_REMATCH[2] >= 71))); then
 	all_errors=(--retry-all-errors) counted=1
 fi
+# --no-progress-meter (curl 7.67) keeps curl's "Will retry in N seconds"
+# warnings, so a source cut short while curl sleeps between retries is not
+# counted as one more attempt; older curl runs -s (and counts nothing).
+quiet=(-s)
+[ "$counted" = 0 ] || quiet=(--no-progress-meter)
 
 part=$out.part err=$out.err
 trap 'rm -f "$part" "$err"' EXIT
 start=$(date +%s)
-attempts=0
+attempts=0 total=0
 
 # try SOURCE URL BOUND CURL_ARGS...: download to $part within BOUND seconds
 # (and the deadline) and verify it; 0 when it matches. attempts: curl's own,
-# each failed one prints a "curl: (N)" line under -sS; one cut short by
-# timeout(1) prints none.
+# each failed one prints a "curl: (N)" line; one cut short by timeout(1)
+# prints none, unless curl was sleeping before a retry (its last line then is
+# the "Will retry" warning, and no attempt was running).
 try() {
 	local src=$1 u=$2 bound=$3 rc=0 failed got why
 	shift 3
@@ -109,14 +117,22 @@ try() {
 			return 1
 		fi
 	fi
-	timeout -k 5 "$bound" curl -fsSL --proto =https,http --proto-redir =https --connect-timeout 10 \
-		--speed-limit 1048576 --speed-time "$speed_time" --max-filesize 268435456 "$@" -o "$part" "$u" 2>"$err" || rc=$?
+	timeout -k 5 "$bound" curl -fSL "${quiet[@]}" --proto =https,http --proto-redir =https --connect-timeout 10 \
+		--speed-limit 262144 --speed-time "$speed_time" --max-filesize 268435456 "$@" -o "$part" "$u" 2>"$err" || rc=$?
 	failed=$(grep -c '^curl: (' "$err" || :)
-	why=$(tail -n1 "$err")
+	why=$(grep '^curl: (' "$err" | tail -n1 || :)
 	if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-		failed=$((failed + 1)) why="cut short at ${bound}s"
+		if tail -n1 "$err" | grep -q 'Will retry in'; then
+			why="cut short at ${bound}s between retries"
+		else
+			failed=$((failed + 1)) why="cut short at ${bound}s"
+		fi
 	fi
-	if [ "$counted" = 1 ]; then attempts=$((failed + (rc == 0 ? 1 : 0))); else attempts='?'; fi
+	if [ "$counted" = 1 ]; then
+		attempts=$((failed + (rc == 0 ? 1 : 0))) total=$((total + attempts))
+	else
+		attempts='?' total='?'
+	fi
 	if [ "$rc" != 0 ]; then
 		echo "rbe-fetch: name=$name source=$src attempts=$attempts error=\"$why\"" >&2
 		return 1
@@ -153,5 +169,5 @@ if try upstream "$url" $((max_time + 90 + 5)) --retry 5 --retry-delay "$delay" "
 	--max-time "$max_time" --retry-max-time 90; then
 	done_line upstream
 fi
-echo "rbe-fetch: name=$name status=failed source=- attempts=$attempts bytes=0 seconds=$(($(date +%s) - start)) mirror=$mirror_state" >&2
+echo "rbe-fetch: name=$name status=failed source=- attempts=$total bytes=0 seconds=$(($(date +%s) - start)) mirror=$mirror_state" >&2
 exit 1

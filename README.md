@@ -44,9 +44,13 @@ docs/provenance/          # the gascity and beads commit maps this history was f
   against their pinned sha256s. Time is bounded so that an outage fails setup
   well inside the pool breaker's 10-minute window: the mirror about 80 s
   (`--max-time 60 --retry-max-time 20`), upstream about 210 s (`--max-time
-  120 --retry-max-time 90`), every attempt `--speed-limit 1048576
-  --speed-time 15` and `--max-filesize 268435456`, and all downloads of one
-  run share a 5-minute deadline (`RBE_FETCH_DEADLINE`).
+  120 --retry-max-time 90`), every attempt `--speed-limit 262144
+  --speed-time 15` and `--max-filesize 268435456`. All downloads of one VM
+  share one 240 s deadline (`RBE_FETCH_DEADLINE`, kept in
+  `$RUNNER_TEMP/rbe-fetch-deadline`, so the worker step reuses the measure
+  step's), so downloads hold a VM about 245 s at most in all (each source
+  stops within 5 s of the deadline). Package installs and the rest of setup
+  come on top of that.
   `RBE_DIST_MIRROR` (optional, an `https://` base, for example
   `https://rbe-warm.ops.gascity.com/dist`; infra README "Pinned setup
   downloads on R2") is tried first, at `<base>/<name>/<version>/<file>`. It

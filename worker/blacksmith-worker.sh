@@ -200,6 +200,8 @@ GO_VERSION=$(awk '/^go /{print $2; exit}' "$RBE_PRODUCT_ROOT/go.mod")
 # other version takes its checksum from go.dev's JSON at run time (and the
 # mirror is then checked against that).
 case "$GO_VERSION" in
+# On a Go bump add the new version's line and keep the previous one:
+# rbe-worker-legacy.yml provisions the previous Go during a grace window.
 1.27.3) GO_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40 ;;
 *) GO_SHA256= ;;
 esac
@@ -239,10 +241,18 @@ apt_install "${WORKER_TOOLSET[@]}"
 # Setup downloads go through rbe-fetch: retried, RBE_DIST_MIRROR first when
 # set, each checked against its pinned sha256 whatever the source (GitHub
 # release 504s took the OSS pool down on 2026-11-08). A total failure still
-# fails setup. All of them share one deadline, so a slow outage fails this
-# step within about 5 minutes (the pool breaker counts a worker that lived 10
-# minutes as healthy); each one is bounded on its own too (rbe-fetch).
-export RBE_FETCH_DEADLINE=$(($(date +%s) + 300))
+# fails setup. Every download of this VM shares one deadline, 240 s after the
+# first step that reached here (the measure step), kept in $RUNNER_TEMP so
+# that the worker step reuses it rather than starting a new one: a slow
+# outage fails setup within about 4 minutes of downloads in all (the pool
+# breaker counts a worker that lived 10 minutes as healthy). Each download is
+# bounded on its own too (rbe-fetch).
+fetch_deadline=$(cat "$RUNNER_TEMP/rbe-fetch-deadline" 2>/dev/null || :)
+if [[ ! $fetch_deadline =~ ^[1-9][0-9]{0,11}$ ]]; then
+	fetch_deadline=$(($(date +%s) + 240))
+	echo "$fetch_deadline" >"$RUNNER_TEMP/rbe-fetch-deadline"
+fi
+export RBE_FETCH_DEADLINE=$fetch_deadline
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
 	go_sum=$GO_SHA256
 	if [ -z "$go_sum" ]; then

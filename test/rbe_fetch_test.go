@@ -185,7 +185,9 @@ func TestRBEFetchTotalFailureExitsNonZero(t *testing.T) {
 		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
 			t.Fatalf("rbe-fetch: %v, want exit 1\n%s", err, out)
 		}
-		wantLine(t, out, `status=failed source=- attempts=6 bytes=0 seconds=[0-9]+ mirror=miss$`)
+		// The failed line sums both sources: the mirror's 3 (--retry 2) and
+		// upstream's 6 (--retry 5).
+		wantLine(t, out, `status=failed source=- attempts=9 bytes=0 seconds=[0-9]+ mirror=miss$`)
 		if n := srv.count("/up/nl.tgz"); n != 6 {
 			t.Errorf("upstream requests = %d, want 6 (--retry 5)", n)
 		}
@@ -273,7 +275,7 @@ func TestRBEFetchOldCurlWithoutRetryAllErrors(t *testing.T) {
 			t.Errorf("curl %s: --retry-all-errors %s, want %s (%s)", tc.version, got, tc.want, args)
 		}
 		for _, want := range []string{"--retry 5 --retry-delay 1", "--connect-timeout 10", "--max-time 20 --retry-max-time 90",
-			"--speed-limit 1048576 --speed-time 15", "--max-filesize 268435456", "--proto-redir =https"} {
+			"--speed-limit 262144 --speed-time 15", "--max-filesize 268435456", "--proto-redir =https"} {
 			if !strings.Contains(string(args), want) {
 				t.Errorf("curl %s args lack %q: %s", tc.version, want, args)
 			}
@@ -300,7 +302,10 @@ func TestRBEWorkerSetupDownloadsUseRBEFetch(t *testing.T) {
 		`"nativelink/${NL_VERSION}/nativelink-${NL_VERSION}-x86_64-unknown-linux-musl.tar.gz"`,
 		// One deadline for every setup download, well inside the pool
 		// breaker's 10-minute "survived" window.
-		"\nexport RBE_FETCH_DEADLINE=$(($(date +%s) + 300))\n" + `if ! /usr/local/go/bin/go version`,
+		// One per VM: the measure step's, reused by the worker step.
+		`fetch_deadline=$(cat "$RUNNER_TEMP/rbe-fetch-deadline" 2>/dev/null || :)`,
+		"\tfetch_deadline=$(($(date +%s) + 240))\n\techo \"$fetch_deadline\" >\"$RUNNER_TEMP/rbe-fetch-deadline\"\n",
+		"export RBE_FETCH_DEADLINE=$fetch_deadline\n" + `if ! /usr/local/go/bin/go version`,
 		// Only https:// reaches rbe-fetch from the workflow.
 		`[[ ! $RBE_DIST_MIRROR =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._/-]*)?$ ]]`,
 	} {
@@ -426,4 +431,22 @@ func TestRBEFetchDeadlineBoundsATricklingOutage(t *testing.T) {
 	if err == nil || up.count("/up") != 0 || !strings.Contains(out, "attempts=0 error=\"setup deadline passed\"") {
 		t.Errorf("a passed deadline: %v, %d requests\n%s", err, up.count("/up"), out)
 	}
+}
+
+// A source cut by the deadline while curl sleeps before a retry ran one
+// attempt, not two.
+func TestRBEFetchCutBetweenRetriesCountsNoExtraAttempt(t *testing.T) {
+	srv := newFetchServer(t, nil, map[string][]int{"/up": {503}})
+	deadline := strconv.FormatInt(time.Now().Add(3*time.Second).Unix(), 10)
+	out, _, err := runFetch(t, "", sha256Hex([]byte("x")), "-", srv.URL+"/up", "RBE_FETCH_RETRY_DELAY=30", "RBE_FETCH_DEADLINE="+deadline)
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		t.Fatalf("rbe-fetch: %v, want exit 1\n%s", err, out)
+	}
+	if n := srv.count("/up"); n != 1 {
+		t.Fatalf("upstream requests = %d, want 1 (then the deadline, during curl's 30 s wait)", n)
+	}
+	if !strings.Contains(out, "attempts=1 error=\"cut short at ") || !strings.Contains(out, "between retries") {
+		t.Errorf("want one attempt, cut between retries:\n%s", out)
+	}
+	wantLine(t, out, `status=failed source=- attempts=1 `)
 }

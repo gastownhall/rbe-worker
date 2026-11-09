@@ -498,6 +498,10 @@ func TestRBEWorkerRegistersOnDrift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pool worker on a drifted host: %v\n%s", err, out)
 	}
+	// The setup downloads' deadline, kept for the VM's next step (rbe-fetch).
+	if b, err := os.ReadFile(filepath.Join(tmp, "rbe-fetch-deadline")); err != nil || !regexp.MustCompile(`^[1-9][0-9]{9}\n$`).Match(b) {
+		t.Errorf("no setup download deadline in RUNNER_TEMP: %q %v", b, err)
+	}
 	measured, err := os.ReadFile(filepath.Join(tmp, "worker-env.txt"))
 	if err != nil {
 		t.Fatal(err)
